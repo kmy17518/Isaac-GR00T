@@ -289,6 +289,102 @@ class TestSyntheticV30VsV21:
                     )
 
 
+class TestV30Caching:
+    """The v3.0 per-file caches must speed up access *without changing data*:
+    each consolidated parquet/mp4 is opened once, not once per episode."""
+
+    def test_cache_preserves_data(self, synthetic_pair):
+        """Cached (default) and disabled (size 0) loaders return identical data."""
+        v30, _, _ = synthetic_pair
+        cfg = _modality_configs()
+        cached = LeRobotEpisodeLoader(v30, cfg)
+        uncached = LeRobotEpisodeLoader(v30, cfg, data_cache_size=0)
+        for ep in range(len(cached)):
+            a = _episode_low_dim(cached, ep)
+            b = _episode_low_dim(uncached, ep)
+            assert set(a) == set(b)
+            for key in a:
+                if key.startswith("language."):
+                    assert a[key] == b[key], key
+                else:
+                    np.testing.assert_array_equal(a[key], b[key], err_msg=key)
+
+    def test_opens_each_file_once(self, synthetic_pair, monkeypatch):
+        """With caching on, reading every episode opens each data file exactly once
+        (and strictly fewer times than the episode count)."""
+        import gr00t.data.dataset.lerobot_episode_loader as loader_mod
+
+        v30, _, ep_lengths = synthetic_pair
+        loader = LeRobotEpisodeLoader(v30, _modality_configs())
+
+        opened: list[str] = []
+        original = loader_mod.pq.read_table
+
+        def _counting(path, *args, **kwargs):
+            opened.append(str(path))
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(loader_mod.pq, "read_table", _counting)
+        for ep in range(len(loader)):
+            loader._load_parquet_data(ep)
+
+        n_files = len(loader._file_row_base)
+        assert len(opened) == n_files
+        assert len(set(opened)) == n_files
+        assert n_files < len(ep_lengths)  # multiple episodes share each file
+
+    def test_disabled_cache_reopens_per_episode(self, synthetic_pair, monkeypatch):
+        """Disabling the cache reverts to one open per episode — proving the cache
+        (not some other change) is what collapses the reads."""
+        import gr00t.data.dataset.lerobot_episode_loader as loader_mod
+
+        v30, _, ep_lengths = synthetic_pair
+        loader = LeRobotEpisodeLoader(v30, _modality_configs(), data_cache_size=0)
+
+        opened: list[str] = []
+        original = loader_mod.pq.read_table
+
+        def _counting(path, *args, **kwargs):
+            opened.append(str(path))
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(loader_mod.pq, "read_table", _counting)
+        for ep in range(len(loader)):
+            loader._load_parquet_data(ep)
+
+        assert len(opened) == len(ep_lengths)
+
+
+def test_video_reader_pool_reuses_decoder(monkeypatch):
+    """VideoReaderPool builds one decoder per file and reuses it across calls."""
+    import types
+
+    import gr00t.utils.video_utils as video_utils
+
+    built: list[str] = []
+
+    class _FakeDecoder:
+        def __init__(self, path, **kwargs):
+            built.append(path)
+
+        def get_frames_at(self, indices):
+            arr = np.zeros((len(indices), 2, 2, 3), dtype=np.uint8)
+            return types.SimpleNamespace(data=types.SimpleNamespace(numpy=lambda: arr))
+
+    fake_tc = types.SimpleNamespace(decoders=types.SimpleNamespace(VideoDecoder=_FakeDecoder))
+    monkeypatch.setattr(video_utils, "_lazy_import_torchcodec", lambda: fake_tc)
+    monkeypatch.setattr(video_utils, "resolve_backend", lambda path, backend: "torchcodec")
+
+    pool = video_utils.VideoReaderPool("torchcodec", max_size=4)
+    frames = None
+    for _ in range(5):
+        frames = pool.get_frames_by_indices("/fake/a.mp4", [0, 1])
+    pool.get_frames_by_indices("/fake/b.mp4", [0])
+
+    assert frames.shape == (2, 2, 2, 3)
+    assert built == ["/fake/a.mp4", "/fake/b.mp4"]  # one construction per distinct file
+
+
 # --- Real-data parity (skipped unless BEHAVIOR-1K demos are present) ----------
 
 

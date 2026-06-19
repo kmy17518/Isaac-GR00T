@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 import json
 import logging
 import math
@@ -639,3 +640,76 @@ def get_accumulate_timestamp_idxs(
             global_idxs.append(next_global_idx + i)
         next_global_idx += n_repeats
     return local_idxs, global_idxs, next_global_idx
+
+
+class VideoReaderPool:
+    """Per-process LRU cache of persistent video decoders, keyed by file path.
+
+    LeRobot v3.0 concatenates many episodes into a single mp4 per camera, so a
+    naive reader rebuilds a decoder on *every* episode access — and for
+    torchcodec's default (exact) seek mode that means re-scanning the whole
+    concatenated file to build a frame index each time. Reusing one decoder
+    across all episodes that live in the same file removes that per-episode
+    rebuild while returning byte-identical frames (random access on a decoder is
+    stateless w.r.t. the returned pixels).
+
+    Only torchcodec and decord expose a reusable decoder object; ffmpeg/opencv
+    spawn a process / open-and-release per call, so for those backends this
+    transparently falls back to the stateless :func:`get_frames_by_indices`.
+
+    The pool is intended to be owned by a single ``LeRobotEpisodeLoader`` and is
+    therefore confined to one process. With PyTorch ``DataLoader`` workers each
+    worker forks and lazily populates its own pool, so cached decoders are never
+    shared across processes (which keeps them fork-safe).
+    """
+
+    _POOLED_BACKENDS: tuple[str, ...] = ("torchcodec", "decord")
+
+    def __init__(
+        self,
+        video_backend: str = "torchcodec",
+        max_size: int = 8,
+        video_backend_kwargs: Optional[dict] = None,
+    ) -> None:
+        self.video_backend = video_backend
+        self.max_size = max(1, int(max_size))
+        self.video_backend_kwargs = video_backend_kwargs or {}
+        self._readers: "OrderedDict[str, object]" = OrderedDict()
+
+    def get_frames_by_indices(self, video_path: str, indices: list[int] | np.ndarray) -> np.ndarray:
+        """Decode frames at ``indices`` reusing a cached decoder when possible.
+
+        Matches :func:`get_frames_by_indices` exactly (same backend dispatch,
+        same returned array); the only difference is decoder reuse.
+        """
+        backend = resolve_backend(video_path, self.video_backend)
+        if backend == "torchcodec":
+            return self._reader(video_path, backend).get_frames_at(indices=indices).data.numpy()
+        if backend == "decord":
+            return self._reader(video_path, backend).get_batch(indices).asnumpy()
+        # No reusable decoder for ffmpeg/opencv → identical stateless path.
+        return get_frames_by_indices(video_path, indices, backend, self.video_backend_kwargs)
+
+    def _reader(self, video_path: str, backend: str):
+        reader = self._readers.get(video_path)
+        if reader is not None:
+            self._readers.move_to_end(video_path)
+            return reader
+        if backend == "torchcodec":
+            torchcodec = _lazy_import_torchcodec()
+            reader = torchcodec.decoders.VideoDecoder(
+                video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            )
+        elif backend == "decord":
+            decord = _lazy_import_decord()
+            reader = decord.VideoReader(video_path, **self.video_backend_kwargs)
+        else:  # pragma: no cover - guarded by get_frames_by_indices dispatch
+            raise _unsupported_backend_error("VideoReaderPool", backend, self._POOLED_BACKENDS)
+        self._readers[video_path] = reader
+        while len(self._readers) > self.max_size:
+            self._readers.popitem(last=False)  # evict least-recently-used decoder
+        return reader
+
+    def clear(self) -> None:
+        """Drop all cached decoders (releasing their file handles)."""
+        self._readers.clear()
