@@ -69,6 +69,30 @@ uv pip install --python .venv/bin/python websockets
 
 Quick check: `.venv/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"`.
 
+### 3a. Blackwell GPUs (B200/B300, sm_100/sm_103) — required nvrtc upgrade
+
+The pinned `torch==2.7.1+cu128` bundles an **nvrtc that predates Blackwell**, so its runtime
+JIT compiler rejects the arch and training dies in the Qwen3-VL vision backbone with:
+
+```
+nvrtc: error: invalid value for --gpu-architecture (-arch)
+```
+
+(it surfaces at `qwen3_vl/modeling_qwen3_vl.py … rot_pos_emb → torch.prod(grid_thw)`; it is a
+GPU/toolkit issue, **not** a data/model bug). Check your arch, and if it's Blackwell — compute
+capability `10.x` (`10.0` = B200, `10.3` = B300) — upgrade the nvrtc wheel that torch JIT-loads:
+
+```bash
+# Is this a Blackwell box? (B300 -> "10.3")
+nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+
+# Fix: install a Blackwell-aware nvrtc (torch 2.7.1 loads libnvrtc.so.12 from this wheel).
+uv pip install --python .venv/bin/python nvidia-cuda-nvrtc-cu12==12.9.86
+```
+
+`torch` itself stays at 2.7.1; only the JIT nvrtc is swapped. **Re-apply after any `uv sync`**
+(a resync reverts it to the 12.8 nvrtc). Hopper/Ada/Ampere (H100/A100/RTX) do **not** need this.
+
 ---
 
 ## 4. OmniGibson env + assets (eval)
@@ -210,6 +234,7 @@ CUDA_VISIBLE_DEVICES=1 <behavior_py> -m omnigibson.eval.run_eval \
 - **`KeyError: 'Gr00tN1d6'` / Eagle errors** → you pointed at the N1.6 base; use `nvidia/GR00T-N1.7-3B`.
 - **403 on `nvidia/Cosmos-Reason2-2B`** → accept the HF gate for that account **and** `source .env` so `HF_TOKEN` is in the process env.
 - **`No module named 'websockets'`** → `uv pip install --python .venv/bin/python websockets` (§3).
+- **`nvrtc: error: invalid value for --gpu-architecture (-arch)`** (training crashes in Qwen3-VL `rot_pos_emb`) → Blackwell GPU (B200/B300) with too-old nvrtc; `uv pip install --python .venv/bin/python nvidia-cuda-nvrtc-cu12==12.9.86` (§3a). Re-apply after any `uv sync`.
 - **`uv sync` fails on a wheel / TOML** → use `uv sync --frozen`; the duplicate `[tool.uv.sources]` was already fixed, and aarch64 LFS wheels are irrelevant on x86_64.
 - **Loader can't read the dataset** → it must be v2.1 with `meta/modality.json`; do §6 (convert + deploy).
 - **No eval runner** → use `omnigibson/eval/run_eval.py` (this repo's driver); upstream `omnigibson/learning/eval.py` is absent here.

@@ -39,11 +39,67 @@ See `START.md` for how to run things. This file is the status / handoff.
 
 ---
 
-## Experiment 2 (lerobot-v3.0) — not started
+## Experiment 2 (lerobot-v3.0) — native reader done & validated equal to Exp 1
 
-- The v3 worktree (`Issac-GR00T-lerobot-v3.0`) was **removed** mid-session; the `lerobot-v3.0` branch
-  still has the earlier shared commits cherry-picked, **but not** the later `train_b1k.py` fix.
-- No v3.0 reader work has been done (the GR00T loader still only reads v2.x).
+Worktree `Isaac-GR00T-lerobot-v3.0` on branch `lerobot-v3.0` (at `712fd3a`, == `lerobot-v2.1`).
+The GR00T loader now reads **LeRobot v3.0 natively, no conversion**.
+
+| Step | Status |
+|---|---|
+| Version-aware `LeRobotEpisodeLoader` (v2.x **and** v3.0) | ✅ done |
+| v3.0 metadata: `meta/episodes/*.parquet`, `meta/tasks.parquet` | ✅ done |
+| v3.0 data: multi-episode parquet sliced by `episode_index` | ✅ done |
+| v3.0 video: concatenated per-key mp4, frame offset `round(from_timestamp*fps)` | ✅ done |
+| `modality.json` deployed into `turning_on_radio_v3.0` | ✅ done |
+| **Loader parity vs v2.1** (state/action/lang/stats exact; video MAE=0) | ✅ 40/40 exact |
+| **Stats paths on v3.0** (`generate_stats`, `generate_rel_stats`) == v2.1 | ✅ exact |
+| **Cross-check vs real `lerobot` reader** (state/action exact, video MAE=0) | ✅ 15/15 exact |
+| CPU pytest (`tests/gr00t/data/test_lerobot_v3_parity.py`) | ✅ 18 passed |
+| No regression on legacy v2.x tests | ✅ 100 passed / 12 skip |
+| **GPU training (real weights, 4×B300, 10 steps)** | ✅ v3.0 `train_loss=1.1146` == v2.1 `1.1145` (≈Exp 1's 1.12) |
+
+**Design decision — no `lerobot` dependency in the training env.** Adding `lerobot` (0.4.x, the
+v3.0-capable lib) hard-conflicts with GR00T's pins (`datasets==3.6.0` vs `>=4.0.0`, `av==16.1.0`
+vs `<16.0.0`, `wandb==0.23.0` vs `<0.22.0`) and drags in teleop/viz deps. The native reader is
+self-contained (`pyarrow`/`pandas` only). `lerobot` stays isolated in `scripts/lerobot_conversion`
+and is used only as an **optional parity oracle** (`scripts/b1k/validate_v3_lerobot_parity.py`).
+
+**Why "equal to Exp 1" is provable:** Exp 1's `turning_on_radio` (v2.1) was converted **from**
+`turning_on_radio_v3.0`; both are on disk, so the v3.0 reader is diffed directly against the v2.1
+reader on identical underlying trajectories (and independently against `lerobot`).
+
+### New / changed files (uncommitted)
+- `gr00t/data/dataset/lerobot_episode_loader.py` — version-aware v3.0 reading (the only core change).
+- `scripts/b1k/validate_v3_parity.py` — v3.0-vs-v2.1 parity harness (state/action/lang/stats/video).
+- `scripts/b1k/validate_v3_lerobot_parity.py` — cross-venv native-vs-`lerobot` parity check.
+- `tests/gr00t/data/test_lerobot_v3_parity.py` — synthetic (CI-safe) + real-data parity tests.
+- `tests/scripts/test_v3_lerobot_parity.py` — gated wrapper for the `lerobot` cross-check.
+
+### GPU training: nvrtc B300 fix (RESOLVED) + end-to-end loss parity
+The box is **8× NVIDIA B300 (sm_103)**. The originally-pinned `torch==2.7.1+cu128` ships an nvrtc
+that rejects sm_103 → `nvrtc: error: invalid value for --gpu-architecture` inside Qwen3-VL
+`rot_pos_emb` (`torch.prod(grid_thw)`), failing **both** v3.0 and v2.1 identically at the model
+forward (so it was always infra, never the LeRobot format).
+
+**Fix (already applied in the shared `.venv`):** upgrade the nvrtc wheel that torch JIT-loads to a
+B300-aware build —
+```bash
+uv pip install --python /home/stuart/ThunderPuppies/Isaac-GR00T/.venv/bin/python nvidia-cuda-nvrtc-cu12==12.9.86
+```
+(torch 2.7.1 stays; it loads `nvidia/cuda_nvrtc/lib/libnvrtc.so.12` from this wheel, now 12.9 which
+knows sm_103). NB: a fresh `uv sync` reverts to the 12.8 nvrtc, so re-apply this after any resync,
+or pin it. The v3.0 worktree reuses this `.venv` (via `PYTHONPATH`), so the fix is active here too.
+
+**Result (real weights, 4×B300 (GPUs 4–7), global-batch 64, 10 steps, identical config):**
+
+| Run | nvrtc error | `train_loss` | grad_norm |
+|---|---|---|---|
+| v3.0 (native) | none | **1.1146484** | 0.225364 |
+| v2.1 (Exp 1)  | none | **1.1144531** | 0.226072 |
+
+Δloss ≈ 2e-4 (GPU reduction nondeterminism; data is provably identical), both ≈ Exp 1's `loss≈1.12`.
+This closes the end-to-end equivalence: **native v3.0 training == v2.1 (Experiment 1) training.**
+Logs: `/tmp/b1k_v3_real.log`, `/tmp/b1k_v21_real.log`.
 
 ---
 
@@ -71,6 +127,14 @@ See `START.md` for how to run things. This file is the status / handoff.
 - **Cosmos-Reason2-2B is gated** — needs HF gate access + `HF_TOKEN` exported into the train/serve process.
 - **modality.json is per-dataset but identical content** across all R1Pro b1k tasks; deploy via the helper.
 - **No upstream eval runner** in this checkout — `omnigibson/eval/` has the `Evaluator`/`WebsocketPolicy`/metrics + post-hoc `score_utils.py`, so we wrote `run_eval.py`.
+- **LeRobot v3.0 layout (vs v2.1):** `data_path`/`video_path` switch from `episode_{chunk,index}` to
+  `{chunk_index,file_index}`; `episodes.jsonl`/`tasks.jsonl` → `meta/episodes/*.parquet` + `meta/tasks.parquet`;
+  **many episodes per data parquet** (slice by the `episode_index` column) and **per-key concatenated mp4**
+  (this episode's frames start at `round(from_timestamp*fps)` — verified exact). Global `stats.json` is the
+  same and `data/*/*.parquet` glob already matches v3.0, so `generate_stats` is format-agnostic.
+- **B300 (sm_103) + nvrtc:** `torch 2.7.1+cu128`'s bundled nvrtc rejects sm_103; **fixed** by
+  `uv pip install nvidia-cuda-nvrtc-cu12==12.9.86` into the `.venv` (torch JIT-loads the newer
+  nvrtc). Independent of dataset format — it broke Exp 1 identically. Re-apply after any `uv sync`.
 
 ---
 
@@ -81,4 +145,8 @@ See `START.md` for how to run things. This file is the status / handoff.
    `serve_b1k` (`checkpoint-50`, `r1pro.py`, `HF_TOKEN`) + `run_eval.py` on `turning_on_radio`.
 2. **Validate `run_eval.py`** end-to-end (it's untested), then commit it + add `websockets` to `pyproject`.
 3. **Run a real Experiment-1 training** (e.g. global 256 / 128-per-GPU) → eval that checkpoint for a real Q-score.
-4. **Experiment 2:** re-create the v3.0 worktree, replicate the `train_b1k.py` fix there, then build the v3.0 reader.
+4. **Experiment 2 reader: ✅ done & validated end-to-end** (see section above) — incl. a real v3.0
+   training run whose loss matches v2.1/Exp 1 (nvrtc B300 fix applied). Remaining: a full-length
+   training run + eval rollout (Shared F) for a real Q-score.
+5. **Commit** the v3.0 reader + parity tests on `lerobot-v3.0` (nothing committed yet). Consider
+   pinning `nvidia-cuda-nvrtc-cu12==12.9.86` so the B300 fix survives `uv sync`.
