@@ -86,6 +86,7 @@ class DatasetFactory:
                 training=True,
                 num_shards_per_epoch=self.config.data.num_shards_per_epoch,
                 override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+                mock_dataset_mode=self.config.data.mock_dataset_mode,
             ),
             None,
         )

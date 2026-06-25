@@ -171,6 +171,11 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    mock_dataset_mode: bool = False
+    """If True, decode a single shard once and replay it forever (no further video
+    decode). Removes the data-loading bottleneck so the GPU is always fed — used to
+    benchmark the compute-bound ceiling (e.g. FA2 vs FA3). Not for real training."""
+
     decode_only_used_frames: bool = False
     """If True, decode only the video frames each shard actually uses instead of
     every frame in the touched episodes (identical training data; cuts decode work

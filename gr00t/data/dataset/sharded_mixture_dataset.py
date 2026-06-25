@@ -224,6 +224,7 @@ class ShardedMixtureDataset(IterableDataset):
         training: bool = True,
         num_shards_per_epoch: int = int(1e5),
         override_pretraining_statistics: bool = False,
+        mock_dataset_mode: bool = False,
     ):
         """Initialize mixture dataset with datasets, weights, and configuration."""
         self.datasets = datasets
@@ -234,6 +235,9 @@ class ShardedMixtureDataset(IterableDataset):
         self.epoch = 0
         self.processor = processor
         self.override_pretraining_statistics = override_pretraining_statistics
+        # Best-case dataloading: decode a single shard once and replay it forever
+        # (no further video decode). Used to measure the compute-bound ceiling.
+        self.mock_dataset_mode = mock_dataset_mode
 
         # Generate initial shard sampling schedule
         self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
@@ -422,6 +426,25 @@ class ShardedMixtureDataset(IterableDataset):
         self.curr_shard_index = -1
         self.cache_next_shard()
         rng = np.random.default_rng(self.seed + self.epoch)
+
+        # Mock mode: decode exactly one shard, then replay its (already processed)
+        # datapoints forever with no further video decode. This removes the data
+        # pipeline so the GPU is always fed — used to measure the compute-bound
+        # ceiling and the true attention-backend (FA2 vs FA3) speedup.
+        if self.mock_dataset_mode:
+            self.curr_shard_index += 1
+            self.finish_cache_shard()
+            assert self.curr_shard is not None
+            cached_shard = list(self.curr_shard)
+            print(
+                f"Rank {self.rank}, Worker {self.worker_id}: mock_dataset_mode ON — "
+                f"replaying {len(cached_shard)} cached datapoints (no further decode)."
+            )
+            while True:
+                indices_in_shard = np.arange(len(cached_shard))
+                rng.shuffle(indices_in_shard)
+                for index in indices_in_shard:
+                    yield cached_shard[index]
 
         # Continuous iteration with epoch management
         while True:

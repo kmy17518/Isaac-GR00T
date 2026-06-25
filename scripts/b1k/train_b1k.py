@@ -76,6 +76,7 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.mock_dataset_mode = ft_config.mock_dataset_mode
     config.data.decode_only_used_frames = ft_config.decode_only_used_frames
 
     run(config)
