@@ -171,6 +171,12 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    decode_only_used_frames: bool = False
+    """If True, decode only the video frames each shard actually uses instead of
+    every frame in the touched episodes (identical training data; cuts decode work
+    and memory by ~1/episode_sampling_rate). Recommended with small episode
+    sampling rates to relieve the dataloader (video-decode) bottleneck."""
+
     experiment_name: str = "gr00t-b1k-finetune"
     """Name of the experiment for logging purposes (e.g., wandb)."""
     
