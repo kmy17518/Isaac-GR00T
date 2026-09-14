@@ -27,6 +27,29 @@ cd $PATH_TO_BEHAVIOR_1K
 ./setup.sh --new-env --omnigibson --bddl --joylo --dataset --eval
 ```
 
+#### Blackwell GPUs (B300)
+
+- **B300, `sm_103`)** — needs a newer NVRTC. Precompiled kernels are fine (`sm_100` SASS runs on `sm_103`), but torch's bundled CUDA 12.8 NVRTC predates `sm_103`, so every kernel PyTorch compiles *at runtime* (the "jiterator" ops, e.g. `torch.prod` on int64 in Qwen3-VL's `rot_pos_emb`) dies on the very first training step — and again in `serve_b1k.py` — with:
+
+  ```
+  nvrtc: error: invalid value for --gpu-architecture (-arch)
+  ```
+
+  Fix: install CUDA 12.9's NVRTC (same `libnvrtc.so.12` soname, ABI-compatible) into the venv once, then put it ahead of torch's copy in **every shell** you train or serve from:
+
+  ```
+  uv pip install --python .venv/bin/python "nvidia-cuda-nvrtc-cu12>=12.9.86,<13"   # once
+
+  source .venv/bin/activate
+  source scripts/activate_b300.sh          # each new shell, after activating the venv
+  ```
+
+  `activate_b300.sh` prepends the wheel's `lib/` dir to `LD_LIBRARY_PATH` (which wins over the RUNPATH torch uses to find `libnvrtc.so.12`), prints `B300 environment configured: NVRTC 12.9.x ...` on success, is idempotent, and warns with the install command if the wheel is missing. If you do not have the script, the equivalent one-liner is:
+
+  ```
+  export LD_LIBRARY_PATH="$(python -c 'import site; print(site.getsitepackages()[0])')/nvidia/cuda_nvrtc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ```
+
 The N1.7 backbone `nvidia/Cosmos-Reason2-2B` is gated. Accept the gate at [https://huggingface.co/nvidia/Cosmos-Reason2-2B](https://huggingface.co/nvidia/Cosmos-Reason2-2B) before training. 
 
 ### Finetune GR00T
@@ -152,6 +175,7 @@ After finetuning, you can run evaluation by following the steps below:
 1. Deploy finetuned checkpoint:
   ```
     source .venv/bin/activate
+    # source scripts/activate_b300.sh     # B300 only, see "Blackwell GPUs" above
     CUDA_VISIBLE_DEVICES=0 python scripts/b1k/serve_b1k.py \
         --model-path $PATH_TO_CKPT \
         --modality-config-path examples/b1k/r1pro.py \
