@@ -32,6 +32,11 @@ class B1KFinetuneConfig(FinetuneConfig):
     """W&B project the run is logged to (``--wandb-project``); the run name is
     ``--experiment-name``. Defaults to the B1K project this script has always used."""
 
+    dataloader_prefetch_factor: int | None = None
+    """Batches each dataloader worker keeps ready (PyTorch default 2). Each one is a full per-GPU
+    batch in shared memory (~4.8 MB/sample), so 1 halves the dataloader's host-RAM footprint and
+    lets you run more workers under a tight RAM limit."""
+
     use_ddp: bool = False
     """Multi-GPU with plain PyTorch DDP instead of the default DeepSpeed ZeRO-2. Use it where
     DeepSpeed is unavailable (e.g. aarch64 hosts: ``pyproject.toml`` only pins it on x86_64).
@@ -141,6 +146,7 @@ if __name__ == "__main__":
     config.training.optim = "adamw_torch"
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
+    config.training.dataloader_prefetch_factor = ft_config.dataloader_prefetch_factor
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
     config.training.output_dir = ft_config.output_dir
