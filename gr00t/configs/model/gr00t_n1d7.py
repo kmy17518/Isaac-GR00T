@@ -49,6 +49,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_flash_attention: bool = True
     load_bf16: bool = False  # Enable BF16 loading
     backbone_trainable_params_fp32: bool = True
+    # Batched (bitwise-identical) Qwen3-VL position-id / vision position computations instead of
+    # the stock per-sample / per-image Python loops, which make large batches CPU-bound.
+    fast_vl_position_ids: bool = True
 
     ### Processing parameters
     image_crop_size: tuple[int, int] | None = (230, 230)

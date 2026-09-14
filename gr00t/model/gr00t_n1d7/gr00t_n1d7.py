@@ -538,6 +538,7 @@ class Gr00tN1d7(PreTrainedModel):
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            fast_vl_position_ids=getattr(config, "fast_vl_position_ids", True),
         )
 
         # Initialize action head

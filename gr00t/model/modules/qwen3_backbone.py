@@ -44,6 +44,7 @@ class Qwen3Backbone(torch.nn.Module):
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
         transformers_loading_kwargs: dict = {},
+        fast_vl_position_ids: bool = True,
     ):
         """
         Qwen3Backbone is to generate n_queries to represent the future action hidden states.
@@ -51,6 +52,10 @@ class Qwen3Backbone(torch.nn.Module):
             model_name: nvidia/Cosmos-Reason2-2B
             tune_llm: whether to tune the LLM model (default: False)
             tune_visual: whether to tune the visual model (default: False)
+            fast_vl_position_ids: replace Qwen3-VL's per-sample / per-image Python loops for
+                M-RoPE position ids and vision position tables with batched, bitwise-identical
+                implementations (gr00t.model.modules.qwen3_vl_fast_positions). Large batches
+                are otherwise CPU-bound on those loops.
         """
         if not _QWEN3VL_AVAILABLE:
             raise ImportError(
@@ -82,6 +87,16 @@ class Qwen3Backbone(torch.nn.Module):
             **extra_kwargs,
             **transformers_loading_kwargs,
         ).eval()
+
+        if fast_vl_position_ids:
+            from gr00t.model.modules.qwen3_vl_fast_positions import apply_fast_qwen3_vl_positions
+
+            if apply_fast_qwen3_vl_positions(self.model):
+                logger.info("Qwen3-VL: using batched position-id / vision position computations")
+            else:
+                logger.warning(
+                    "Qwen3-VL: fast_vl_position_ids requested but model type unsupported"
+                )
 
         # needed since we don't use these layers. Also saves compute
         while len(self.model.language_model.layers) > select_layer:
