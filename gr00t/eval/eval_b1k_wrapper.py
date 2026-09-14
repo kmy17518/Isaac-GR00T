@@ -1,10 +1,19 @@
+import logging
+from pathlib import Path
+
 import cv2
-import numpy as np
-import torch
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS, ROBOT_OBS_CONFIGS
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.policy.policy import BasePolicy
-from pathlib import Path
+import numpy as np
+import torch
+
+
+logger = logging.getLogger(__name__)
+
+# Observation key under which the OmniGibson evaluator sends the challenge task index
+# (``omnigibson.eval.evaluator.Evaluator._preprocess_obs``); matches the dataset's task_index.
+TASK_ID_OBS_KEY = "task_id"
 
 
 def resize_with_pad(image: np.ndarray, target_height: int, target_width: int) -> np.ndarray:
@@ -81,12 +90,23 @@ def _slice_batch(batch, indices):
 
 
 class B1KPolicyWrapper:
+    """Adapts a GR00T policy to the OmniGibson evaluator's observation/action interface.
+
+    Language prompt: either a fixed ``text_prompt`` for every request, or a
+    ``task_prompts`` table (challenge ``task_id`` -> prompt) resolved per request
+    from the ``task_id`` the evaluator includes in each observation (see
+    ``gr00t.data.b1k_prompts`` and ``scripts/b1k/serve_b1k.py``). The prompt is
+    fed under the policy's own language key, so it lands where training put it.
+    """
+
     def __init__(
         self,
         policy: BasePolicy,
         embodiment_tag: EmbodimentTag,
         modality_config: dict,
-        text_prompt: str = "pick up the object and place it on the table",
+        text_prompt: str | None = None,
+        task_prompts: dict[int, str] | None = None,
+        language_key: str | None = None,
         control_mode: str = "temporal_ensemble",
         obs_size: tuple[int, int] = (224, 224),
         action_horizon: int = 10,
@@ -96,7 +116,20 @@ class B1KPolicyWrapper:
         self.robot_obs = ROBOT_OBS_CONFIGS[embodiment_tag.value] # Serving-only fields
         self.modality_config = modality_config
         self.policy = policy
+        if text_prompt is None and not task_prompts:
+            raise ValueError(
+                "B1KPolicyWrapper needs a prompt: pass text_prompt (fixed for all requests) "
+                "or task_prompts (task_id -> prompt, resolved from the evaluator's task_id obs)."
+            )
         self.text_prompt = text_prompt
+        self.task_prompts = dict(task_prompts) if task_prompts else {}
+        self._logged_task_ids: set[int] = set()
+        # Feed the prompt under the key the checkpoint was trained with.
+        if language_key is None:
+            language_key = getattr(policy, "language_key", None)
+        if language_key is None:
+            language_key = self.robot["language"].modality_keys[0]
+        self.language_key = language_key
         self.control_mode = control_mode
         self.action_horizon = action_horizon
         self.obs_size = obs_size
@@ -145,6 +178,40 @@ class B1KPolicyWrapper:
 
             self.step_counter = np.zeros(batch_size, dtype=np.int32)
 
+    def resolve_prompts(self, obs: dict, batch_size: int) -> list[str]:
+        """Text prompt for each batch element: the fixed prompt, or the table entry for the
+        challenge ``task_id`` the evaluator sends with the observation."""
+        if self.text_prompt is not None:
+            return [self.text_prompt] * batch_size
+
+        task_ids = obs.get(TASK_ID_OBS_KEY)
+        if task_ids is None:
+            raise KeyError(
+                f"Observation has no {TASK_ID_OBS_KEY!r} to resolve the prompt from; serve with a "
+                "fixed prompt (--task-name / --text-prompt) or send task_id with each observation."
+            )
+        task_ids = np.asarray(task_ids).reshape(-1)
+        if task_ids.size == 1:
+            task_ids = np.repeat(task_ids, batch_size)
+        elif task_ids.size != batch_size:
+            raise ValueError(
+                f"{TASK_ID_OBS_KEY!r} has {task_ids.size} entries for a batch of {batch_size}"
+            )
+
+        prompts = []
+        for task_id in task_ids.tolist():
+            task_id = int(task_id)
+            if task_id not in self.task_prompts:
+                raise KeyError(
+                    f"task_id {task_id} is not in the prompt table (known: "
+                    f"{sorted(self.task_prompts)}); check --tasks-file matches the evaluator."
+                )
+            if task_id not in self._logged_task_ids:
+                self._logged_task_ids.add(task_id)
+                logger.info(f"task_id {task_id} -> prompt {self.task_prompts[task_id]!r}")
+            prompts.append(self.task_prompts[task_id])
+        return prompts
+
     def process_input(self, obs: dict) -> tuple[dict, int]:
         """
         Process the input dictionary to match the expected input format for the model.
@@ -174,10 +241,12 @@ class B1KPolicyWrapper:
         for state_key in sorted(self.modality_config["state"].keys()):
             start, end = self.modality_config["state"][state_key]["start"], self.modality_config["state"][state_key]["end"]
             state[state_key] = prop_state[..., start:end]
+        # Language is list[list[str]] of shape (B, T=1), keyed by the checkpoint's language key.
+        prompts = self.resolve_prompts(obs, batch_size)
         processed_input = {
             "video": video,
             "state": state,
-            "language": {"annotation.human.task_description": [[self.text_prompt] for _ in range(batch_size)]},
+            "language": {self.language_key: [[prompt] for prompt in prompts]},
         }
         return processed_input, batch_size
 
