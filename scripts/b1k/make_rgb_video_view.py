@@ -14,17 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a training "view" of a LeRobot v3.0 dataset whose RGB videos are pre-resized, losslessly.
+"""Build a training "view" of a LeRobot v3.0 dataset whose RGB videos are pre-resized and re-encoded, losslessly.
 
-Why: decoding the BEHAVIOR demos (720x720 / 480x480 HEVC) is more than half of a dataloader
-worker's CPU, and the first thing the GR00T image pipeline does with every frame is deterministic:
-``LetterBoxPad`` (no-op on square frames) then ``SmallestMaxSize(shortest_image_edge,
-INTER_AREA)`` -- the random crop / second resize / colour jitter come after. Applying exactly that
-head once, offline, and storing the result **losslessly in RGB** (``libx264rgb -qp 0``, 4:4:4
-predictive) gives the random stages bit-identical inputs while the decoder handles ~8x fewer pixels
-(measured: 214 -> 1590 frames/s on the 720p camera). Nothing else changes: ``data/`` and ``meta/``
-are symlinked (episode/frame indexing, stats caches and the ``*.mp4`` path template are unchanged),
-depth streams and unselected chunks/files are symlinked too.
+Why: decoding the BEHAVIOR demos is most of a dataloader worker's CPU, for two reasons. (1) The
+sharded dataset samples *strided* steps (every ~10th frame of an episode per shard), and with
+inter-frame coding (GOP 8 in the source) the decoder must reconstruct every frame in the span to
+output the ones used -- ~10 frames decoded per frame used. (2) The 720x720 camera is decoded at full
+resolution although the first thing the GR00T image pipeline does with every frame is deterministic:
+``LetterBoxPad`` (no-op on square frames) then ``SmallestMaxSize(shortest_image_edge, INTER_AREA)``;
+the random crop / second resize / colour jitter come after. This script applies exactly that head
+once, offline, and stores the result **losslessly in RGB** (``libx264rgb -qp 0``, 4:4:4) with a
+**short GOP** (``--gop 10``) and CAVLC entropy coding, so a strided read costs ~1 decoded frame per
+used frame and each frame is cheap to decode. Measured on the stride-10 pattern, single-threaded:
+source 10.4 + 2x5.6 ms CPU per sample (3 cameras) -> 1.8 + 2x1.6 ms; files ~40 GB per task.
+Nothing else changes: ``data/`` and ``meta/`` are symlinked (episode/frame indexing, stats caches
+and the ``*.mp4`` path template are unchanged), depth streams and unselected chunks/files are
+symlinked too, and every downstream random stage sees bit-identical inputs.
 
 Every transcoded file is verified bitwise on sampled frames (decoded view frame == pipeline head
 applied to the decoded source frame) and recorded in ``<view>/RGB_VIEW_MANIFEST.json``.
@@ -36,8 +41,9 @@ Usage:
     # then train with --dataset-path /data/2026-challenge-demos-rgb256
 
 ``--shortest-edge`` must equal the model's ``shortest_image_edge`` / ``image_target_size`` (256 for
-GR00T N1.7); a view is only exact for that resolution. The eval/serving path is unaffected (live
-frames go through the full pipeline).
+GR00T N1.7); a view is only exact for that resolution. Long-GOP lossless files (x264 default GOP
+250 + CABAC) decode *slower* than the source for strided reads -- keep ``--gop`` at or below the
+sampling stride. The eval/serving path is unaffected (live frames go through the full pipeline).
 """
 
 from __future__ import annotations
@@ -75,6 +81,8 @@ def transcode_file(
     decode_threads: int = 4,
     encode_threads: int = 4,
     preset: str = "medium",
+    gop: int = 10,
+    cabac: bool = False,
     verify_samples: int = 24,
     seed: int = 0,
 ) -> dict:
@@ -114,6 +122,16 @@ def transcode_file(
         preset,
         "-pix_fmt",
         "rgb24",
+        # fixed short GOP (no scene-cut keyframes) so strided reads decode ~1 frame per used frame;
+        # CAVLC decodes ~2.5x cheaper than CABAC on lossless frames for ~10 % more bytes
+        "-g",
+        str(gop),
+        "-keyint_min",
+        str(gop),
+        "-sc_threshold",
+        "0",
+        "-x264-params",
+        f"cabac={int(cabac)}",
         "-threads",
         str(encode_threads),
         "-movflags",
@@ -234,6 +252,17 @@ def main() -> int:
     p.add_argument("--decode-threads", type=int, default=4)
     p.add_argument("--encode-threads", type=int, default=4)
     p.add_argument("--preset", default="medium")
+    p.add_argument(
+        "--gop",
+        type=int,
+        default=10,
+        help="keyframe interval; keep <= the sampling stride (every ~10th step)",
+    )
+    p.add_argument(
+        "--cabac",
+        action="store_true",
+        help="CABAC entropy coding (smaller files, ~2.5x slower decode)",
+    )
     p.add_argument("--verify-samples", type=int, default=24)
     args = p.parse_args()
 
@@ -280,7 +309,7 @@ def main() -> int:
         {
             "source_root": str(source.resolve()),
             "shortest_edge": args.shortest_edge,
-            "codec": "libx264rgb -qp 0 (lossless RGB 4:4:4)",
+            "codec": f"libx264rgb -qp 0 -g {args.gop} {'cabac' if args.cabac else 'cavlc'} (lossless RGB 4:4:4)",
             "pipeline_head": "LetterBoxPad + SmallestMaxSize(shortest_edge, INTER_AREA)",
             "versions": {
                 "albumentations": A.__version__,
