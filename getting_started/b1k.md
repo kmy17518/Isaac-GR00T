@@ -205,6 +205,14 @@ What a step costs, measured on 4× B300 at 1024 samples per GPU (global batch 40
       --modality-json examples/b1k/r1pro.json --shortest-edge 256 --gop 10 --jobs 4
   # then: --dataset-path $DATA_ROOT/2026-challenge-demos-rgb256  (same --task-names, same stats)
   ```
+- **GPU-side work, measured on the compiled step** (1024 samples/GPU, fwd+bwd 1.97 s before these changes): the frozen backbone's *inference* is ~58 % of it (vision tower 35 %, LLM 16 %), the trainable action head the rest.
+  - **Patch embedding as `F.linear`** (`fast_vl_patch_embed`, default on; same math). Qwen3-VL's patch embedding is a `Conv3d` whose kernel is the whole 2×16×16 patch — a linear layer in disguise — and cuDNN has no good kernel for it: 115 ms per step (a generic `sm80` implicit GEMM plus a layout transform) vs 1.3 ms as a GEMM. The linear result is *closer* to an fp32 reference than the convolution's.
+  - **No LM head** (*exact*). Only the pre-norm output of the last kept decoder layer is used; `Qwen3Backbone` now captures it with a forward hook while running the base `Qwen3VLModel`, so the 151k-vocabulary GEMM is never issued — even with `logits_to_keep=1` cuBLAS spent ~90 ms per step on that shape.
+  - `--backbone-attn-implementation gr00t_fast` (`gr00t/model/modules/fast_attention.py`). HF's `flash_attention_2` runs FlashAttention‑2 kernels that ignore Blackwell's tensor memory and force a `torch.compile` graph break in every block. `gr00t_fast` uses PyTorch SDPA (cuDNN / flash backends) for regular batches — `is_causal` for the decoder, and the packed image segments viewed as a regular `(n_images, heads, 256, d)` batch for the vision tower (HF otherwise loops over the segments) — and FlashAttention **varlen** for padded, multi-task batches: **FlashAttention‑4** (`pip install --prerelease=allow "flash-attn-4[cu13]"`, CuTe DSL, JIT; works on `sm_103`) when installed, else FA2. Numerics: cos 0.99994 to an fp32 reference for both FA2 and `gr00t_fast`; losses agree to 6 decimals on regular and padded batches. Step effect −4.5 %. In isolation FA4 is 1.1–1.4× faster than FA2 on these shapes but slower than cuDNN SDPA for the unpadded ones, which is why it only serves the padded path. `--sdpa-backend-priority cudnn,efficient,flash,math` reorders torch's SDPA backends (default puts cuDNN last); it made no measurable difference at the step level here.
+  - `--compile-coordinate-descent` (Inductor `coordinate_descent_tuning`): −3.5 % step for ~1 min more compile per process (cached afterwards). `--compile-persistent-reductions False` is what lets the `vlsa` blocks compile on Blackwell (their layer-norm backward otherwise becomes a persistent-reduction kernel needing more shared memory than exists) — another −1 %.
+  - **What did not pay off:** CUDA graphs (`--compile-mode reduce-overhead`) — kernel time is ~92 % of the step so the ceiling is small, cudagraph-trees trips over block outputs kept alive across replays (deepstack features), and at 1024/GPU the graph pools do not fit next to the 253 GB the step already uses. FP8 for the frozen backbone (~0.9 s of the step is its inference; Blackwell FP8 GEMMs are ~2× bf16) would be the next lever, but it changes the features the policy is trained on — a decision, not a free optimisation.
+  - Net: fwd+bwd **1.97 → 1.64 s** at 1024/GPU (eval-mode losses identical to 6 decimals; train-mode differences are dropout RNG under Inductor).
+- **`GR00T_FFMPEG_THREADS`** (env, dataloader workers; default FFmpeg auto = up to 16 threads per decoder). With 48 workers on a 130-core quota the auto setting ran ~770 decoder threads: 129 cores busy, of which ~60 were contention. `GR00T_FFMPEG_THREADS=4` → 69 cores busy for *more* throughput; the step went 2.33 → 1.93 s. Same decoded frames.
 - `--wandb-project` (default `B1K`), `--use-ddp` (see [DeepSpeed on aarch64 hosts](#deepspeed-on-aarch64-hosts)).
 
 Example: 4× B300 (284 GB each), 130-core CPU budget, 900 GiB host RAM limit — global batch 4096 uses ~205 GB per GPU with DeepSpeed ZeRO-2:
@@ -219,10 +227,13 @@ torchrun --nproc_per_node=4 --master_port=29500 scripts/b1k/train_b1k.py \
     --num-gpus 4 --global-batch-size 4096 \
     --output-dir $OUTPUT_DIR --save-steps 2500 --save-total-limit 3 --max-steps 150000 \
     --dataloader-num-workers 12 --dataloader-prefetch-factor 1 --decode-only-used-frames \
-    --compile-blocks vision,llm,dit
+    --backbone-attn-implementation gr00t_fast \
+    --compile-blocks vision,llm,dit,vlsa --compile-coordinate-descent --compile-persistent-reductions False
 ```
 
-With the stock code this configuration ran at 7.3 s/step (GPU idle most of the time on position ids, then CPU-bound on video decode); with everything above — the exact changes, `--compile-blocks` and the re-encoded video view — it runs at ~2.4 s/step with the GPUs at 90–97 % utilisation, i.e. GPU-bound: 130 h for 150k steps instead of 300 h. Watch `Wait for shard … in 0.00 seconds` in the log; non-zero waits mean the dataloader is the limit again (add workers if you have the cores and RAM).
+(with `GR00T_FFMPEG_THREADS=4` exported for the dataloader workers)
+
+With the stock code this configuration ran at 7.3 s/step (GPU idle most of the time on position ids, then CPU-bound on video decode); with everything above — the exact data changes, the re-encoded video view, `--compile-blocks`, `gr00t_fast` attention, the patch-embedding/LM-head fixes and 4 decoder threads per worker — it runs at **1.9 s/step** with the GPUs at 97–99 % utilisation: 80 h for 150k steps instead of 300 h. Watch `Wait for shard … in 0.00 seconds` in the log; non-zero waits mean the dataloader is the limit again (add workers if you have the cores and RAM).
 
 #### Language prompt
 
