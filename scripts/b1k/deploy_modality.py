@@ -7,6 +7,9 @@ template (``examples/b1k/r1pro.json``) is copied verbatim into each
 ``<task>/meta/modality.json``. Before copying, each dataset's ``meta/info.json``
 is validated against that layout, so any task that deviates from the expected
 format is reported loudly instead of being silently mis-sliced at train time.
+The tasks table each language annotation key resolves through (``meta/tasks.jsonl``,
+which carries both the natural-language ``task`` description and the snake_case
+``task_name``) is checked the same way.
 
 Usage:
     python scripts/b1k/deploy_modality.py <b1k_root> [--template PATH] [--dry-run]
@@ -61,7 +64,40 @@ def _validate_template(template: dict[str, Any]) -> None:
         )
 
 
-def _validate_dataset(info: dict[str, Any], template: dict[str, Any]) -> list[str]:
+def _validate_tasks_table(meta_dir: Path, ann_key: str, meta: dict[str, Any]) -> list[str]:
+    """Check that the tasks table an annotation key resolves through exists and has its field.
+
+    Mirrors the ``tasks_file`` / ``task_field`` contract of
+    ``gr00t.data.dataset.lerobot_episode_loader`` so a dataset whose
+    ``meta/tasks.jsonl`` lacks e.g. the natural-language ``task`` field is
+    reported here instead of failing (or silently training on the wrong text) later.
+    """
+    tasks_file = meta.get("tasks_file")
+    if tasks_file is None:
+        return []  # canonical LeRobot table; nothing extra to check
+    task_field = meta.get("task_field", "task")
+    tasks_path = meta_dir / tasks_file
+    if not tasks_path.is_file():
+        return [f"annotation '{ann_key}' -> missing tasks table 'meta/{tasks_file}'"]
+    if tasks_path.suffix != ".jsonl":
+        return []  # parquet tables are validated by the loader at train time
+    errors: list[str] = []
+    with open(tasks_path, "r") as f:
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get(task_field) in (None, ""):
+                errors.append(
+                    f"annotation '{ann_key}' -> meta/{tasks_file}:{line_number} "
+                    f"(task_index {row.get('task_index')}) has no '{task_field}' field"
+                )
+    return errors
+
+
+def _validate_dataset(
+    info: dict[str, Any], template: dict[str, Any], meta_dir: Path | None = None
+) -> list[str]:
     """Return a list of format errors (empty list means the dataset is compatible)."""
     features = info.get("features", {})
     errors: list[str] = []
@@ -93,6 +129,8 @@ def _validate_dataset(info: dict[str, Any], template: dict[str, Any]) -> list[st
         original_key = meta["original_key"]
         if original_key not in features:
             errors.append(f"annotation '{ann_key}' -> missing feature '{original_key}'")
+        if meta_dir is not None:
+            errors.extend(_validate_tasks_table(meta_dir, ann_key, meta))
 
     return errors
 
@@ -147,7 +185,9 @@ def main() -> int:
     written = unchanged = failed = 0
     for dataset in datasets:
         dst = dataset / "meta" / "modality.json"
-        errors = _validate_dataset(_load_json(dataset / "meta" / "info.json"), template)
+        errors = _validate_dataset(
+            _load_json(dataset / "meta" / "info.json"), template, meta_dir=dataset / "meta"
+        )
         if errors:
             failed += 1
             print(f"[FAIL] {dataset}")

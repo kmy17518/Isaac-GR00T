@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""B1K serving: prompt resolution and the observation the policy wrapper builds for the model.
+"""B1K prompt plumbing: train-side language-key selection, serve-side prompt resolution, and
+the observation the policy wrapper builds for the model.
 
 CPU-only: the GR00T policy is replaced by a stub exposing ``language_key`` (and, for the
 control-mode tests, a ``get_action`` that echoes a per-env marker).
@@ -27,7 +28,9 @@ from pathlib import Path
 import sys
 
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS, ROBOT_OBS_CONFIGS
+from gr00t.data.b1k_prompts import DEFAULT_PROMPT_SOURCE, language_key
 from gr00t.data.embodiment_tags import EmbodimentTag
+from gr00t.data.types import ModalityConfig
 from gr00t.eval.eval_b1k_wrapper import (
     TASK_ID_OBS_KEY,
     B1KPolicyWrapper,
@@ -132,31 +135,131 @@ def _obs(task_id: int | None = 0, batch: int | None = None) -> dict:
     return obs
 
 
+class TestModalityConfigDefault:
+    def test_r1pro_default_follows_default_prompt_source(self, r1pro_registered):
+        assert r1pro_registered["language"].modality_keys == [language_key(DEFAULT_PROMPT_SOURCE)]
+
+
+class TestTrainSideSelection:
+    def _configs(self):
+        return {
+            "new_embodiment": {
+                "language": ModalityConfig(
+                    delta_indices=[0], modality_keys=["annotation.human.task_name"]
+                )
+            }
+        }
+
+    def test_select_prompt_source_rewrites_language_key(self):
+        from scripts.b1k.train_b1k import select_prompt_source
+
+        configs = self._configs()
+        key = select_prompt_source(configs, "new_embodiment", "task_description")
+        assert key == "annotation.human.task_description"
+        assert configs["new_embodiment"]["language"].modality_keys == [key]
+        assert configs["new_embodiment"]["language"].delta_indices == [0]
+        with pytest.raises(ValueError, match="Unknown B1K prompt source"):
+            select_prompt_source(configs, "new_embodiment", "coarse_action")
+        with pytest.raises(ValueError, match="No modality config registered"):
+            select_prompt_source(configs, "other_embodiment", "task_name")
+
+    def test_resolve_language_key_defaults_to_modality_config(self):
+        from scripts.b1k.train_b1k import resolve_language_key
+
+        configs = self._configs()
+        # No --prompt-source: keep whatever the modality config declares, untouched.
+        assert resolve_language_key(configs, "new_embodiment", None) == "annotation.human.task_name"
+        assert configs["new_embodiment"]["language"].modality_keys == ["annotation.human.task_name"]
+        # --prompt-source overrides it.
+        key = resolve_language_key(configs, "new_embodiment", "task_description")
+        assert key == "annotation.human.task_description"
+        assert configs["new_embodiment"]["language"].modality_keys == [key]
+
+
 class TestServeSideResolution:
     def _config(self, **overrides):
         from scripts.b1k.serve_b1k import ServerConfig
 
         return ServerConfig(model_path="unused", modality_config_path=str(R1PRO_PY), **overrides)
 
-    def test_default_resolves_description_per_task_id(self):
+    def test_prompt_kind_follows_checkpoint_language_key(self):
         from scripts.b1k.serve_b1k import resolve_prompts
 
-        text, table = resolve_prompts(self._config())
-        assert text is None
-        assert len(table) == 100 and table[0].startswith("Turn on the radio")
+        text, table = resolve_prompts(self._config(), "annotation.human.task_description")
+        assert text is None and table[0].startswith("Turn on the radio")
+        text, table = resolve_prompts(self._config(), "annotation.human.task_name")
+        assert text is None and table[0] == "turning_on_radio" and len(table) == 100
 
     def test_task_name_fixes_prompt(self):
         from scripts.b1k.serve_b1k import resolve_prompts
 
-        text, table = resolve_prompts(self._config(task_name="turning_on_radio"))
+        text, table = resolve_prompts(
+            self._config(task_name="turning_on_radio"), "annotation.human.task_description"
+        )
         assert table is None and text.startswith("Turn on the radio")
+
+    def test_prompt_source_override_for_legacy_checkpoints(self):
+        """Checkpoints trained before the loader fix carry the task_description key but saw task
+        names; --prompt-source task_name keeps serving consistent with them."""
+        from scripts.b1k.serve_b1k import resolve_prompts
+
+        text, _ = resolve_prompts(
+            self._config(task_name="turning_on_radio", prompt_source="task_name"),
+            "annotation.human.task_description",
+        )
+        assert text == "turning_on_radio"
 
     def test_text_prompt_bypasses_everything(self):
         from scripts.b1k.serve_b1k import resolve_prompts
 
         assert resolve_prompts(
-            self._config(text_prompt="do the thing", tasks_file="/nonexistent")
+            self._config(text_prompt="do the thing", tasks_file="/nonexistent"),
+            "annotation.human.coarse_action",
         ) == ("do the thing", None)
+
+    def test_unknown_language_key_requires_explicit_choice(self):
+        from scripts.b1k.serve_b1k import resolve_prompts
+
+        with pytest.raises(ValueError, match="pass --prompt-source or --text-prompt"):
+            resolve_prompts(self._config(), "annotation.human.coarse_action")
+
+
+class TestDeployModalityValidation:
+    def test_tasks_table_field_is_validated(self, tmp_path):
+        from scripts.b1k.deploy_modality import _validate_dataset
+
+        template = json.loads(R1PRO_JSON.read_text())
+        info = {
+            "features": {
+                "observation.state": {"dtype": "float32", "shape": [61]},
+                "action": {"dtype": "float32", "shape": [23]},
+                "task_index": {"dtype": "int64", "shape": [1]},
+                **{meta["original_key"]: {"dtype": "video"} for meta in template["video"].values()},
+            }
+        }
+        meta_dir = tmp_path / "meta"
+        meta_dir.mkdir()
+
+        # No sidecar at all -> both prompt kinds are reported.
+        errors = _validate_dataset(info, template, meta_dir=meta_dir)
+        assert len(errors) == 2 and all("missing tasks table" in e for e in errors)
+
+        # Sidecar without the natural-language field -> only task_description fails.
+        (meta_dir / "tasks.jsonl").write_text(
+            json.dumps({"task_index": 0, "task_name": "turning_on_radio"}) + "\n"
+        )
+        errors = _validate_dataset(info, template, meta_dir=meta_dir)
+        assert errors == [
+            "annotation 'human.task_description' -> meta/tasks.jsonl:1 (task_index 0) "
+            "has no 'task' field"
+        ]
+
+        # Complete sidecar -> clean.
+        (meta_dir / "tasks.jsonl").write_text(
+            json.dumps({"task_index": 0, "task_name": "turning_on_radio", "task": "Turn it on."})
+            + "\n"
+        )
+        assert _validate_dataset(info, template, meta_dir=meta_dir) == []
 
 
 class TestPolicyWrapperLanguage:
