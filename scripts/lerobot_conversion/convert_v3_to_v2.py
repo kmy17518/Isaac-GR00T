@@ -125,22 +125,71 @@ def load_episode_records(root: Path) -> list[dict[str, Any]]:
     return records
 
 
-def convert_tasks(root: Path, new_root: Path) -> None:
-    logging.info("Converting tasks parquet to legacy JSONL")
+def load_tasks_sidecar(root: Path) -> list[dict[str, Any]] | None:
+    """Rows of a ``meta/tasks.jsonl`` shipped next to the v3.0 ``tasks.parquet``, if any.
+
+    LeRobot v3.0 itself has no ``tasks.jsonl``, but some datasets ship one as a
+    sidecar carrying extra text per task. The BEHAVIOR challenge demos, for
+    example, store the snake_case task id as the parquet task string and provide
+    ``{"task_index", "task_name", "task"}`` rows in ``tasks.jsonl``, where
+    ``task`` is the natural-language instruction.
+    """
+
+    sidecar_path = root / LEGACY_TASKS_PATH
+    if not sidecar_path.is_file():
+        return None
+    with jsonlines.open(sidecar_path) as reader:
+        return list(reader)
+
+
+def convert_tasks(root: Path, new_root: Path) -> dict[str, str]:
+    """Write the legacy ``meta/tasks.jsonl``.
+
+    Returns a mapping from each v3.0 parquet task string to the ``task`` string
+    written to the legacy file, so ``episodes.jsonl`` can be kept consistent with it.
+
+    If the source dataset ships a ``tasks.jsonl`` sidecar (see
+    :func:`load_tasks_sidecar`), it is carried over verbatim so every text field
+    survives the conversion; regenerating it from the parquet alone would reduce
+    each task to its parquet string (for BEHAVIOR, the task id) and silently drop
+    the natural-language description.
+    """
+
     tasks = load_tasks(root)
     tasks = tasks.sort_values("task_index")
+    parquet_tasks = {
+        int(row["task_index"]): _to_serializable(task) for task, row in tasks.iterrows()
+    }
 
     out_path = new_root / LEGACY_TASKS_PATH
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with jsonlines.open(out_path, mode="w") as writer:
-        for task, row in tasks.iterrows():
-            writer.write(
-                {
-                    "task_index": int(row["task_index"]),
-                    "task": _to_serializable(task),
-                }
+    sidecar = load_tasks_sidecar(root)
+    if sidecar is not None:
+        sidecar_by_index: dict[int, dict[str, Any]] = {}
+        for row in sidecar:
+            if "task_index" not in row or "task" not in row:
+                raise ValueError(
+                    f"{root / LEGACY_TASKS_PATH} rows must have 'task_index' and 'task'; got {row}"
+                )
+            sidecar_by_index[int(row["task_index"])] = row
+        if set(sidecar_by_index) != set(parquet_tasks):
+            raise ValueError(
+                f"{root / LEGACY_TASKS_PATH} covers task indices {sorted(sidecar_by_index)} but "
+                f"meta/tasks.parquet has {sorted(parquet_tasks)}; fix or remove the sidecar."
             )
+        logging.info("Carrying over the existing tasks JSONL sidecar (%d tasks)", len(sidecar))
+        shutil.copy2(root / LEGACY_TASKS_PATH, out_path)
+        return {
+            parquet_tasks[task_index]: str(row["task"])
+            for task_index, row in sidecar_by_index.items()
+        }
+
+    logging.info("Converting tasks parquet to legacy JSONL")
+    with jsonlines.open(out_path, mode="w") as writer:
+        for task_index, task in sorted(parquet_tasks.items()):
+            writer.write({"task_index": task_index, "task": task})
+    return {task: task for task in parquet_tasks.values()}
 
 
 def convert_info(
@@ -423,7 +472,18 @@ def convert_videos(
                 _extract_video_segment(src_path, dest_path, start=start, end=end)
 
 
-def convert_episodes_metadata(new_root: Path, episode_records: list[dict[str, Any]]) -> None:
+def convert_episodes_metadata(
+    new_root: Path,
+    episode_records: list[dict[str, Any]],
+    task_strings: dict[str, str] | None = None,
+) -> None:
+    """Write legacy ``episodes.jsonl`` / ``episodes_stats.jsonl``.
+
+    ``task_strings`` (from :func:`convert_tasks`) maps v3.0 task strings to the
+    ``task`` strings of the legacy ``tasks.jsonl``; each episode's ``tasks`` list is
+    remapped through it so both files agree, as LeRobot v2.1 expects.
+    """
+
     logging.info("Reconstructing legacy episodes and episodes_stats JSONL files")
 
     episodes_path = new_root / LEGACY_EPISODES_PATH
@@ -444,6 +504,12 @@ def convert_episodes_metadata(new_root: Path, episode_records: list[dict[str, An
                 and not key.startswith("meta/")
                 and key not in {"dataset_from_index", "dataset_to_index"}
             }
+
+            if task_strings and "tasks" in legacy_episode:
+                legacy_episode["tasks"] = [
+                    task_strings.get(task, task)
+                    for task in _to_serializable(legacy_episode["tasks"])
+                ]
 
             # Ensure legacy episodes include a length; compute from dataset indices if missing
             if "length" not in legacy_episode:
@@ -518,10 +584,10 @@ def convert_dataset(
 
     convert_info(root, new_root, episode_records, video_keys)
     copy_global_stats(root, new_root)
-    convert_tasks(root, new_root)
+    task_strings = convert_tasks(root, new_root)
     convert_data(root, new_root, episode_records, chunks_size)
     convert_videos(root, new_root, episode_records, video_keys, chunks_size)
-    convert_episodes_metadata(new_root, episode_records)
+    convert_episodes_metadata(new_root, episode_records, task_strings)
     copy_ancillary_directories(root, new_root)
 
     shutil.move(str(root), str(backup_root))
