@@ -38,6 +38,14 @@ class B1KFinetuneConfig(FinetuneConfig):
     backbone applies the processor's fp32 rescale+normalize on the GPU, bit-identically.
     ``bfloat16``: normalized patches cast to bf16 (also bit-identical under bf16 compute, half
     the bytes). ``None``: the processor's float32. Saved in the checkpoint's processor config."""
+    backbone_attn_implementation: str | None = None
+    """transformers attention implementation for the VLM backbone. ``None``: flash_attention_2 if
+    installed, else sdpa. ``gr00t_fast``: cuDNN/SDPA for regular batches and packed image segments
+    (~2x faster than FlashAttention-2 on Blackwell, traceable by torch.compile) and FlashAttention
+    varlen -- FA4 (``pip install flash-attn-4``) if installed, else FA2 -- for padded batches."""
+    sdpa_backend_priority: str | None = None
+    """Global torch SDPA backend order, e.g. ``cudnn,efficient,flash,math``; torch's default puts
+    cuDNN last, on Blackwell it is the fastest for the action head's attention. ``None``: default."""
 
     dataloader_prefetch_factor: int | None = None
     """Batches each dataloader worker keeps ready (PyTorch default 2). Each one is a full per-GPU
@@ -155,6 +163,8 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.collate_pixel_values_dtype = ft_config.collate_pixel_values_dtype
+    config.model.backbone_attn_implementation = ft_config.backbone_attn_implementation
+    config.model.sdpa_backend_priority = ft_config.sdpa_backend_priority
     config.model.reproject_vision = False
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True

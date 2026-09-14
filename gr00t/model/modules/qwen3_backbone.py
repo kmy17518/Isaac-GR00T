@@ -98,6 +98,7 @@ class Qwen3Backbone(torch.nn.Module):
         trainable_params_fp32: bool = False,
         transformers_loading_kwargs: dict = {},
         fast_vl_position_ids: bool = True,
+        attn_implementation: str | None = None,
         fast_vl_patch_embed: bool = True,
     ):
         """
@@ -110,6 +111,11 @@ class Qwen3Backbone(torch.nn.Module):
                 M-RoPE position ids and vision position tables with batched, bitwise-identical
                 implementations (gr00t.model.modules.qwen3_vl_fast_positions). Large batches
                 are otherwise CPU-bound on those loops.
+            attn_implementation: transformers attention implementation for the VLM. ``None``
+                keeps the historical choice (``flash_attention_2`` if installed, else ``sdpa``).
+                ``gr00t_fast`` (gr00t.model.modules.fast_attention) uses cuDNN/SDPA for regular
+                batches and packed image segments -- ~2x faster than FA2 on Blackwell and traceable
+                by torch.compile -- and FlashAttention varlen (FA4 if installed) for padded batches.
             fast_vl_patch_embed: run the vision patch embedding (a Conv3d whose kernel is the whole
                 patch) as the equivalent F.linear; cuDNN's kernel for it is ~50x slower on Blackwell.
         """
@@ -124,7 +130,14 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Add attention kwargs
         extra_kwargs = {}
-        if use_flash_attention:
+        if attn_implementation == "gr00t_fast":
+            from gr00t.model.modules.fast_attention import register_gr00t_fast_attention
+
+            register_gr00t_fast_attention()
+            extra_kwargs["attn_implementation"] = "gr00t_fast"
+        elif attn_implementation:
+            extra_kwargs["attn_implementation"] = attn_implementation
+        elif use_flash_attention:
             try:
                 import flash_attn  # noqa: F401
 
@@ -143,6 +156,13 @@ class Qwen3Backbone(torch.nn.Module):
             **extra_kwargs,
             **transformers_loading_kwargs,
         ).eval()
+
+        self.attn_implementation = self.model.config._attn_implementation
+        if self.attn_implementation == "gr00t_fast":
+            from gr00t.model.modules.fast_attention import patch_qwen3_vl_vision_attention
+
+            n = patch_qwen3_vl_vision_attention(self.model.model.visual)
+            logger.info(f"Qwen3-VL: gr00t_fast attention (patched {n} vision attention blocks)")
 
         if fast_vl_patch_embed:
             from gr00t.model.modules.qwen3_vl_fast_patch_embed import (
@@ -236,6 +256,13 @@ class Qwen3Backbone(torch.nn.Module):
                     "uint8 pixel_values need Qwen3Backbone.pixel_patch_normalizer (set by Gr00tN1d7)"
                 )
             vl_input["pixel_values"] = self.pixel_patch_normalizer(vl_input["pixel_values"])
+        if self.attn_implementation == "gr00t_fast":
+            from gr00t.model.modules.fast_attention import (
+                set_packed_segment_length,
+                uniform_segment_length,
+            )
+
+            set_packed_segment_length(uniform_segment_length(vl_input["image_grid_thw"]))
         # Only the pre-norm output of the last kept decoder layer is used (== the causal-LM wrapper's
         # hidden_states[-1]). Capture it with a hook while running the base Qwen3VLModel, which skips
         # the lm_head entirely: even with logits_to_keep=1 the (B, 151k-vocab) GEMM cost ~90 ms per

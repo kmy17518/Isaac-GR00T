@@ -527,6 +527,10 @@ class Gr00tN1d7(PreTrainedModel):
         self.config = config
 
         backbone_cls = get_backbone_cls(config)
+        if getattr(config, "sdpa_backend_priority", None):
+            from gr00t.model.modules.fast_attention import set_sdpa_backend_priority
+
+            set_sdpa_backend_priority(config.sdpa_backend_priority)
         self.backbone = backbone_cls(
             model_name=config.model_name,
             tune_llm=config.tune_llm,
@@ -539,6 +543,7 @@ class Gr00tN1d7(PreTrainedModel):
             trainable_params_fp32=config.backbone_trainable_params_fp32,
             transformers_loading_kwargs=transformers_loading_kwargs,
             fast_vl_position_ids=getattr(config, "fast_vl_position_ids", True),
+            attn_implementation=getattr(config, "backbone_attn_implementation", None),
             fast_vl_patch_embed=getattr(config, "fast_vl_patch_embed", True),
         )
 
