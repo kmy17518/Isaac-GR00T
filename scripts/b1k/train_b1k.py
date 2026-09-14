@@ -32,6 +32,12 @@ class B1KFinetuneConfig(FinetuneConfig):
     """W&B project the run is logged to (``--wandb-project``); the run name is
     ``--experiment-name``. Defaults to the B1K project this script has always used."""
 
+    use_ddp: bool = False
+    """Multi-GPU with plain PyTorch DDP instead of the default DeepSpeed ZeRO-2. Use it where
+    DeepSpeed is unavailable (e.g. aarch64 hosts: ``pyproject.toml`` only pins it on x86_64).
+    Every GPU then holds the full optimizer state, which the trainable action head (a fraction
+    of the 3B model) keeps small. Ignored for ``--num-gpus 1``."""
+
     prompt_source: PromptSource | None = None
     """Which text prompt from the BEHAVIOR dataset (``meta/tasks.jsonl``) conditions the policy:
     ``task_description`` -- natural-language instruction, e.g. "Turn on the radio receiver that's on
@@ -146,6 +152,7 @@ if __name__ == "__main__":
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
+    config.training.use_ddp = ft_config.use_ddp
     config.training.experiment_name = ft_config.experiment_name
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.save_only_model = ft_config.save_only_model
