@@ -52,6 +52,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Batched (bitwise-identical) Qwen3-VL position-id / vision position computations instead of
     # the stock per-sample / per-image Python loops, which make large batches CPU-bound.
     fast_vl_position_ids: bool = True
+    # torch dtype name the data collator emits `pixel_values` in (None = the VLM processor's
+    # float32). "bfloat16" halves the per-batch host/shm/H2D traffic and is bit-identical whenever
+    # the vision tower computes in bf16 (bf16 weights or bf16 autocast). Recorded in the checkpoint's
+    # processor config so training and serving agree.
+    collate_pixel_values_dtype: str | None = None
 
     ### Processing parameters
     image_crop_size: tuple[int, int] | None = (230, 230)

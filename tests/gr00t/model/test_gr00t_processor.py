@@ -269,3 +269,67 @@ class TestFixtureCompleteness:
             f"Fixture has fields that save_pretrained() no longer writes: {extra}. "
             f"Remove them from tests/fixtures/processor_config/processor_config.json."
         )
+
+
+class TestPixelValuesDtype:
+    """The collator can emit pixel_values in a reduced dtype; the setting round-trips through
+    save_pretrained / from_pretrained and reaches the collator."""
+
+    def _collator(self, dtype_name):
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator
+        import torch
+
+        mock_vlm = MagicMock()
+        mock_vlm.tokenizer.padding_side = "left"
+        pixel_values = torch.randn(6, 1536, dtype=torch.float32)
+        mock_vlm.return_value = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 2]]),
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "attention_mask": torch.tensor([[1, 1, 1]]),
+        }
+        with patch(
+            "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+            return_value=mock_vlm,
+        ):
+            collator = Gr00tN1d7DataCollator("mock", pixel_values_dtype=dtype_name)
+        return collator, pixel_values
+
+    def test_collator_casts_pixel_values_only(self):
+        import torch
+
+        collator, pixel_values = self._collator("bfloat16")
+        batch = collator([{"vlm_content": {"text": "t", "images": []}}])["inputs"]
+        assert batch["pixel_values"].dtype == torch.bfloat16
+        assert torch.equal(batch["pixel_values"], pixel_values.to(torch.bfloat16))
+        assert batch["input_ids"].dtype == torch.int64
+        assert batch["image_grid_thw"].dtype == torch.int64
+
+    def test_collator_default_leaves_dtype(self):
+        import torch
+
+        collator, pixel_values = self._collator(None)
+        batch = collator([{"vlm_content": {"text": "t", "images": []}}])["inputs"]
+        assert batch["pixel_values"].dtype == torch.float32
+        assert torch.equal(batch["pixel_values"], pixel_values)
+
+    def test_processor_roundtrip_reaches_collator(self, processor):
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+        assert processor.pixel_values_dtype is None  # fixture default
+        mock_vlm = MagicMock()
+        mock_vlm.tokenizer.padding_side = "left"
+        with patch(
+            "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+            return_value=mock_vlm,
+        ):
+            proc = Gr00tN1d7Processor.from_pretrained(FIXTURE_DIR, pixel_values_dtype="bfloat16")
+            assert proc.pixel_values_dtype == "bfloat16"
+            assert proc.collator.pixel_values_dtype == "bfloat16"
+            with tempfile.TemporaryDirectory() as tmp:
+                proc.save_pretrained(tmp)
+                with open(Path(tmp) / "processor_config.json") as f:
+                    assert json.load(f)["processor_kwargs"]["pixel_values_dtype"] == "bfloat16"
+                reloaded = Gr00tN1d7Processor.from_pretrained(tmp)
+            assert reloaded.pixel_values_dtype == "bfloat16"
+            assert reloaded.collator.pixel_values_dtype == "bfloat16"

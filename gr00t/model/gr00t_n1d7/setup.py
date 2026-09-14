@@ -177,6 +177,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                pixel_values_dtype=self.model_config.collate_pixel_values_dtype,
                 **self.transformers_loading_kwargs,
             )
         else:
@@ -205,6 +206,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                pixel_values_dtype=self.model_config.collate_pixel_values_dtype,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 

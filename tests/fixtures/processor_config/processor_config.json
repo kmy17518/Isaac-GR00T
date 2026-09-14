@@ -136,6 +136,7 @@
     "model_name": "nvidia/Cosmos-Reason2-2B",
     "model_type": "qwen",
     "formalize_language": true,
+    "pixel_values_dtype": null,
     "max_state_dim": 128,
     "max_action_dim": 128,
     "max_action_horizon": 50,
