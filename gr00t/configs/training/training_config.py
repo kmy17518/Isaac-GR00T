@@ -99,6 +99,12 @@ class TrainingConfig:
     # sm_103 that means torch >= 2.9 with CUDA 13 wheels).
     compile_blocks: str | None = None
     compile_mode: str | None = None  # torch.compile mode, e.g. "max-autotune-no-cudagraphs"
+    compile_coordinate_descent: bool = (
+        False  # Inductor coordinate_descent_tuning (slower compile, faster kernels)
+    )
+    compile_persistent_reductions: bool | None = (
+        None  # False: needed to compile "vlsa" on Blackwell
+    )
 
     # Transformers loading parameters
     transformers_trust_remote_code: bool = True

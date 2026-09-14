@@ -60,6 +60,12 @@ class B1KFinetuneConfig(FinetuneConfig):
 
     compile_mode: str | None = None
     """``torch.compile`` mode for ``--compile-blocks`` (e.g. ``max-autotune-no-cudagraphs``)."""
+    compile_coordinate_descent: bool = False
+    """Inductor ``coordinate_descent_tuning`` for the compiled blocks: ~3-4 % faster steps on B300
+    for about a minute more compile time per process (cached in ``TORCHINDUCTOR_CACHE_DIR``)."""
+    compile_persistent_reductions: bool | None = None
+    """Inductor ``triton.persistent_reductions``. ``False`` is required to compile the ``vlsa``
+    blocks on Blackwell (their layer-norm backward otherwise needs more shared memory than exists)."""
 
     use_ddp: bool = False
     """Multi-GPU with plain PyTorch DDP instead of the default DeepSpeed ZeRO-2. Use it where
@@ -187,6 +193,8 @@ if __name__ == "__main__":
     config.training.wandb_project = ft_config.wandb_project
     config.training.use_ddp = ft_config.use_ddp
     config.training.compile_blocks = ft_config.compile_blocks
+    config.training.compile_coordinate_descent = ft_config.compile_coordinate_descent
+    config.training.compile_persistent_reductions = ft_config.compile_persistent_reductions
     config.training.compile_mode = ft_config.compile_mode
     config.training.experiment_name = ft_config.experiment_name
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint

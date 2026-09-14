@@ -36,6 +36,7 @@ config: serving runs different batch shapes and should stay eager.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -88,6 +89,8 @@ def compile_model_blocks(
     mode: str | None = None,
     dynamic: bool | None = False,
     fullgraph: bool = False,
+    coordinate_descent_tuning: bool = False,
+    persistent_reductions: bool | None = None,
 ) -> dict[str, int]:
     """Wrap the ``forward`` of every block in the selected groups with ``torch.compile``.
 
@@ -97,6 +100,13 @@ def compile_model_blocks(
         mode: ``torch.compile`` mode (``None`` = default, ``"max-autotune-no-cudagraphs"``, ...).
         dynamic: passed to ``torch.compile``; ``False`` specialises on the training shapes.
         fullgraph: passed to ``torch.compile``.
+        coordinate_descent_tuning: Inductor's per-kernel block-size search for the fused
+            pointwise/reduction kernels (``torch._inductor.config.coordinate_descent_tuning``);
+            ~3-4 % faster steps on B300 for ~1 min more compile time (cached afterwards).
+        persistent_reductions: ``torch._inductor.config.triton.persistent_reductions``. Set it
+            to ``False`` to compile the ``vlsa`` blocks on Blackwell: their layer-norm backward
+            otherwise becomes a persistent-reduction kernel that needs more shared memory than the
+            GPU has (``No valid triton configs ... OutOfMemoryError``). ``None`` leaves the default.
 
     Returns:
         ``{group: number of blocks compiled}``.
@@ -109,6 +119,12 @@ def compile_model_blocks(
 
     if {"vision", "llm"} & set(targets):
         _exclude_hf_flash_attention_from_dynamo()
+    if coordinate_descent_tuning:
+        torch._inductor.config.coordinate_descent_tuning = True
+    if persistent_reductions is not None:
+        torch._inductor.config.triton.persistent_reductions = persistent_reductions
+        # Inductor's compile-worker subprocesses build their config from the environment.
+        os.environ["TORCHINDUCTOR_PERSISTENT_REDUCTIONS"] = "1" if persistent_reductions else "0"
 
     lists = _block_lists(model)
     compiled: dict[str, int] = {}

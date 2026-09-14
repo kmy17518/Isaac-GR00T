@@ -144,7 +144,15 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             from gr00t.model.modules.compile_blocks import compile_model_blocks
 
             compiled = compile_model_blocks(
-                model, compile_blocks, mode=getattr(self.config.training, "compile_mode", None)
+                model,
+                compile_blocks,
+                mode=getattr(self.config.training, "compile_mode", None),
+                coordinate_descent_tuning=getattr(
+                    self.config.training, "compile_coordinate_descent", False
+                ),
+                persistent_reductions=getattr(
+                    self.config.training, "compile_persistent_reductions", None
+                ),
             )
             logging.info(f"torch.compile enabled for blocks: {compiled}")
 
