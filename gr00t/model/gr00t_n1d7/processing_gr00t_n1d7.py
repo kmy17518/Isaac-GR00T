@@ -97,12 +97,20 @@ class Gr00tN1d7DataCollator:
     ):
         """
         Args:
-            pixel_values_dtype: torch dtype name (e.g. ``"bfloat16"``) to emit ``pixel_values``
-                in, instead of the VLM processor's float32. The vision tower casts pixel values
-                to its own compute dtype anyway, so with a bf16 model or bf16 autocast the
-                result is bit-identical while the batch that crosses dataloader workers ->
-                shared memory -> pinned memory -> GPU is half the size (~2.4 instead of
-                ~4.8 MB per sample for Qwen3-VL). ``None`` leaves the dtype unchanged.
+            pixel_values_dtype: how ``pixel_values`` leave the collator instead of as the VLM
+                processor's normalized float32 patches (~4.8 MB per sample for Qwen3-VL):
+
+                * a float dtype name such as ``"bfloat16"``: the normalized patches cast to
+                  that dtype. The vision tower casts pixel values to its own compute dtype
+                  anyway, so with a bf16 model or bf16 autocast the result is bit-identical
+                  and half the bytes cross dataloader workers -> shared memory -> pinned
+                  memory -> GPU;
+                * ``"uint8"``: the *unnormalized* uint8 patches (a quarter of the bytes, and
+                  no float math in the worker). The VLM processor is asked to skip rescale
+                  and normalize, which are the only value-changing steps after resizing;
+                  ``Qwen3Backbone`` then applies the identical fp32 ``(x - mean*255) /
+                  (std*255)`` on the GPU, so the model sees bit-identical tensors;
+                * ``None``: unchanged float32.
         """
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
@@ -111,8 +119,11 @@ class Gr00tN1d7DataCollator:
         self.model_type = model_type
         self.model_name = model_name
         self.pixel_values_dtype = pixel_values_dtype
+        self._emit_uint8_patches = pixel_values_dtype == "uint8"
         self._pixel_values_torch_dtype = (
-            getattr(torch, pixel_values_dtype) if pixel_values_dtype else None
+            getattr(torch, pixel_values_dtype)
+            if pixel_values_dtype and not self._emit_uint8_patches
+            else None
         )
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
@@ -132,15 +143,25 @@ class Gr00tN1d7DataCollator:
                     curr_image_inputs = v["images"]
                     image_inputs += curr_image_inputs
 
+                image_kwargs = (
+                    # Unnormalized uint8 patches; the backbone normalizes on the GPU.
+                    {"do_rescale": False, "do_normalize": False} if self._emit_uint8_patches else {}
+                )
                 vlm_inputs = self.processor(
                     text=text_list,
                     images=image_inputs,
                     return_tensors="pt",
                     padding=True,
+                    **image_kwargs,
                 )
                 for k, v in vlm_inputs.items():
-                    if k == "pixel_values" and self._pixel_values_torch_dtype is not None:
-                        v = v.to(self._pixel_values_torch_dtype)
+                    if k == "pixel_values":
+                        if self._emit_uint8_patches and v.dtype != torch.uint8:
+                            raise RuntimeError(
+                                f"expected uint8 pixel_values from the VLM processor, got {v.dtype}"
+                            )
+                        if self._pixel_values_torch_dtype is not None:
+                            v = v.to(self._pixel_values_torch_dtype)
                     batch[k] = v
             elif key in (
                 "pixel_values",

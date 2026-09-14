@@ -32,11 +32,12 @@ class B1KFinetuneConfig(FinetuneConfig):
     """W&B project the run is logged to (``--wandb-project``); the run name is
     ``--experiment-name``. Defaults to the B1K project this script has always used."""
 
-    collate_pixel_values_dtype: str | None = "bfloat16"
-    """dtype the data collator emits ``pixel_values`` in. The vision tower casts them to its bf16
-    compute dtype anyway (DeepSpeed bf16 / bf16 autocast), so ``bfloat16`` is bit-identical and
-    halves the ~4.8 MB/sample that crosses dataloader workers -> shared memory -> pinned memory ->
-    GPU. Saved in the checkpoint's processor config; ``None`` keeps the processor's float32."""
+    collate_pixel_values_dtype: str | None = "uint8"
+    """How the data collator emits ``pixel_values``. ``uint8`` (default): the unnormalized uint8
+    patches, a quarter of the processor's float32 bytes and no float math in the worker; the
+    backbone applies the processor's fp32 rescale+normalize on the GPU, bit-identically.
+    ``bfloat16``: normalized patches cast to bf16 (also bit-identical under bf16 compute, half
+    the bytes). ``None``: the processor's float32. Saved in the checkpoint's processor config."""
 
     dataloader_prefetch_factor: int | None = None
     """Batches each dataloader worker keeps ready (PyTorch default 2). Each one is a full per-GPU
