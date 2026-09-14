@@ -74,6 +74,8 @@ Before we can run training, we need GR00T-specific `meta/modality.json`. Deploy 
 python scripts/b1k/deploy_modality.py $DATA_ROOT
 ```
 
+The per-task partial download does not include `meta/tasks.jsonl`, the table both `--prompt-source` options read (see [Language prompt](#language-prompt)); when it is missing from a v3.0 dataset, `deploy_modality.py` installs the repo's verbatim copy (`examples/b1k/tasks.jsonl`) after checking it against the dataset's `meta/tasks.parquet`, and reports `[write] .../meta/tasks.jsonl`.
+
 Normalization statistics (`meta/stats.json`) are generated automatically on the first training run.
 
 #### (Optional) Pre-cache base models
