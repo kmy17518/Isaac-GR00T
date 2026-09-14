@@ -28,6 +28,10 @@ class B1KFinetuneConfig(FinetuneConfig):
     dataset-wide ``meta/stats.json`` is left untouched). Unknown names, or a dataset that
     holds none of the selected tasks, fail fast. Default: every task under the root."""
 
+    wandb_project: str = "B1K"
+    """W&B project the run is logged to (``--wandb-project``); the run name is
+    ``--experiment-name``. Defaults to the B1K project this script has always used."""
+
     prompt_source: PromptSource | None = None
     """Which text prompt from the BEHAVIOR dataset (``meta/tasks.jsonl``) conditions the policy:
     ``task_description`` -- natural-language instruction, e.g. "Turn on the radio receiver that's on
@@ -141,7 +145,7 @@ if __name__ == "__main__":
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
-    config.training.wandb_project = "B1K"
+    config.training.wandb_project = ft_config.wandb_project
     config.training.experiment_name = ft_config.experiment_name
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.save_only_model = ft_config.save_only_model
