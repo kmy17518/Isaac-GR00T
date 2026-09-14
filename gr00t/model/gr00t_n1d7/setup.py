@@ -139,6 +139,15 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         )
         logging.debug(f"Model architecture: {model}")
 
+        compile_blocks = getattr(self.config.training, "compile_blocks", None)
+        if compile_blocks:
+            from gr00t.model.modules.compile_blocks import compile_model_blocks
+
+            compiled = compile_model_blocks(
+                model, compile_blocks, mode=getattr(self.config.training, "compile_mode", None)
+            )
+            logging.info(f"torch.compile enabled for blocks: {compiled}")
+
         return model
 
     def _get_statistics(

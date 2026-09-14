@@ -43,6 +43,15 @@ class B1KFinetuneConfig(FinetuneConfig):
     batch in shared memory (~4.8 MB/sample), so 1 halves the dataloader's host-RAM footprint and
     lets you run more workers under a tight RAM limit."""
 
+    compile_blocks: str | None = None
+    """``torch.compile`` the repeated transformer blocks: comma-separated subset of
+    ``vision,llm,dit,vlsa`` (see ``gr00t.model.modules.compile_blocks``). Fuses the elementwise
+    work around the GEMMs; not bit-identical to eager (bf16-noise level). Training-only setting.
+    Requires an Inductor/Triton that supports the GPU (B300: torch >= 2.9 cu130)."""
+
+    compile_mode: str | None = None
+    """``torch.compile`` mode for ``--compile-blocks`` (e.g. ``max-autotune-no-cudagraphs``)."""
+
     use_ddp: bool = False
     """Multi-GPU with plain PyTorch DDP instead of the default DeepSpeed ZeRO-2. Use it where
     DeepSpeed is unavailable (e.g. aarch64 hosts: ``pyproject.toml`` only pins it on x86_64).
@@ -166,6 +175,8 @@ if __name__ == "__main__":
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
     config.training.use_ddp = ft_config.use_ddp
+    config.training.compile_blocks = ft_config.compile_blocks
+    config.training.compile_mode = ft_config.compile_mode
     config.training.experiment_name = ft_config.experiment_name
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.save_only_model = ft_config.save_only_model
