@@ -46,6 +46,12 @@ class SingleDatasetConfig:
     # If not provided, falls back to dataset_paths for evaluation
     val_dataset_path: Optional[str] = None
 
+    # Optional task subset applied to every root in ``dataset_paths``: only episodes
+    # of these tasks (task strings of the dataset's tasks table, e.g. the BEHAVIOR
+    # ``turning_on_radio``) are trained on, and their normalization statistics are
+    # kept under ``meta/task_subsets/<key>/`` of each root. ``None`` = all tasks.
+    task_names: Optional[List[str]] = None
+
 
 @dataclass
 class DataConfig:

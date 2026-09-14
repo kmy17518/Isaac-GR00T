@@ -111,6 +111,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: Fraction of episode timesteps to use (for efficiency)
         seed: Random seed for reproducible sharding and sampling
         allow_padding: Whether to allow padding of indices to valid range [0, max_length - 1]
+        task_names: Optional task subset; only episodes of these tasks are sharded
+            (see ``LeRobotEpisodeLoader``). ``None`` uses the whole dataset.
 
     Example:
         >>> dataset = ShardedSingleStepDataset(
@@ -141,6 +143,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         seed: int = 42,
         allow_padding: bool = False,
         decode_only_used_frames: bool = False,
+        task_names: list[str] | None = None,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -148,12 +151,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs
+        self.task_names = task_names
         # Decode only the frames each shard uses, not every touched frame (see config).
         self.decode_only_used_frames = decode_only_used_frames
         self._video_delta_indices = (
-            list(modality_configs["video"].delta_indices)
-            if "video" in modality_configs
-            else [0]
+            list(modality_configs["video"].delta_indices) if "video" in modality_configs else [0]
         )
         self.shard_size = shard_size
         self.episode_sampling_rate = episode_sampling_rate
@@ -169,6 +171,7 @@ class ShardedSingleStepDataset(ShardedDataset):
             modality_configs=modality_configs,
             video_backend=video_backend,
             video_backend_kwargs=video_backend_kwargs,
+            task_names=task_names,
         )
 
         # Create balanced shards from episode timesteps
@@ -317,9 +320,7 @@ class ShardedSingleStepDataset(ShardedDataset):
                         if self.allow_padding:
                             idx = max(0, min(idx, ep_len - 1))
                         needed.add(idx)
-                episode_data = self.episode_loader.load_episode(
-                    ep_idx, needed_video_indices=needed
-                )
+                episode_data = self.episode_loader.load_episode(ep_idx, needed_video_indices=needed)
             else:
                 # Load episode data once per episode in shard (decodes all frames)
                 episode_data = self.episode_loader[ep_idx]

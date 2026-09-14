@@ -44,6 +44,21 @@ export DATASET_PATH=$DATA_ROOT/$TASK                                    # e.g. .
 export OUTPUT_DIR=outputs/b1k-$TASK
 ```
 
+#### Which demos are on disk: one task or all 100
+
+The demos are one LeRobot v3.0 dataset on the Hub ([behavior-1k/2026-challenge-demos](https://huggingface.co/datasets/behavior-1k/2026-challenge-demos)); each task is one chunk (`chunk-000` = task 0 = `turning_on_radio`, ...). `--dataset-path` always points at a LeRobot root (`data/`, `meta/`, `videos/`), which is either
+
+- a **per-task partial download** — the challenge docs' `huggingface-cli download --include "data/$CHUNK/**" --include "meta/episodes/$CHUNK/**" --include "videos/*/$CHUNK/**" --include meta/info.json --include meta/stats.json --include meta/tasks.parquet`, holding one task's chunks next to the dataset-wide metadata; or
+- the **full 3.3 TB root** with all 100 tasks.
+
+Training reads whatever is under the root. To train on one (or a few) task(s) pass `--task-names` to `train_b1k.py`; it works identically on both layouts:
+
+```
+--task-names $TASK                      # e.g. turning_on_radio; several names allowed
+```
+
+Only the selected tasks' episodes are loaded, and their normalization statistics are computed over those episodes alone and cached in `meta/task_subsets/<task>/{stats,relative_stats}.json` — the dataset-wide `meta/stats.json` is never overwritten, and other subsets of the same root get their own directory. On the full root this is also what keeps the first run from scanning 3 TB of parquet for statistics. On a partial download of that task the flag is a no-op apart from the stats location; a partial download of *other* tasks fails fast (`No episodes of task ...`), as does a misspelled name. `gr00t/data/stats.py ... --task-names $TASK` precomputes the same files.
+
 #### Dataset version: LeRobot v3.0 (default) or v2.1
 
 The challenge demos ship as **LeRobot v3.0**. The GR00T loader reads both **v3.0** and **v2.1** natively (it auto-detects the version from `meta/info.json`); it only additionally needs the GR00T-specific `meta/modality.json` deployed below. Choose one:
@@ -103,6 +118,7 @@ torchrun --nproc_per_node=8 --master_port=29500 scripts/b1k/train_b1k.py \
     --experiment-name b1k-$TASK \
     --base-model-path nvidia/GR00T-N1.7-3B \
     --dataset-path $DATASET_PATH \
+    --task-names $TASK \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path examples/b1k/r1pro.py \
     --num-gpus 8 \
@@ -111,6 +127,8 @@ torchrun --nproc_per_node=8 --master_port=29500 scripts/b1k/train_b1k.py \
     --save-steps 1500 --save-total-limit 5 --max-steps 150000 \
     --dataloader-num-workers 8 --decode-only-used-frames
 ```
+
+`--task-names $TASK` restricts training to that task whether `$DATASET_PATH` is a per-task partial download or the full 100-task root (see [above](#which-demos-are-on-disk-one-task-or-all-100)); drop it to train on every task under the root.
 
 Checkpoints land in `$OUTPUT_DIR/b1k-$TASK/checkpoint-<step>/`, each one standalone and directly servable.
 

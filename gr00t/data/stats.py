@@ -21,11 +21,15 @@ Calculate dataset statistics for LeRobot datasets.
 Usage:
     python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <embodiment_tag>
     python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <embodiment_tag> --modality-config-path <config.py>
+    python gr00t/data/stats.py --dataset-path <dataset_path> --embodiment-tag <embodiment_tag> --task-names <task> [<task> ...]
 
 Args:
     dataset_path: Path to the dataset.
     embodiment_tag: Embodiment tag to use to load modality configurations.
     modality_config_path: Optional path to a .py config file for custom embodiment tags not in the built-in registry.
+    task_names: Optional task subset. Stats are then computed over those tasks' episodes only and
+        written to ``meta/task_subsets/<key>/`` instead of ``meta/`` (see
+        ``gr00t.data.dataset.lerobot_episode_loader.task_subset_stats_dir``).
 """
 
 import hashlib
@@ -34,14 +38,23 @@ import logging
 import os
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
-from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+from gr00t.data.dataset.lerobot_episode_loader import (
+    LEROBOT_RELATIVE_STATS_FILE_NAME,
+    LEROBOT_STATS_FILE_NAME,
+    LeRobotEpisodeLoader,
+    load_lerobot_info,
+    normalize_task_names,
+    select_task_subset,
+    subset_data_files,
+    task_subset_stats_dir,
+)
 from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
 from gr00t.data.state_action.pose import EndEffectorPose, JointPose
 from gr00t.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
@@ -52,6 +65,21 @@ LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats.json"
 LE_ROBOT_REL_STATS_FILENAME = "meta/relative_stats.json"
+
+
+def stats_file_path(
+    dataset_path: Path | str, task_names: str | Iterable[str] | None = None
+) -> Path:
+    """``meta/stats.json``, or the task subset's ``meta/task_subsets/<key>/stats.json``."""
+    return task_subset_stats_dir(dataset_path, task_names) / LEROBOT_STATS_FILE_NAME
+
+
+def rel_stats_file_path(
+    dataset_path: Path | str, task_names: str | Iterable[str] | None = None
+) -> Path:
+    """``meta/relative_stats.json``, or the task subset's counterpart."""
+    return task_subset_stats_dir(dataset_path, task_names) / LEROBOT_RELATIVE_STATS_FILE_NAME
+
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +163,9 @@ def _dump_stats_cache_atomic(path: Path, data: dict[str, Any], *, indent: int | 
 
 
 def calculate_dataset_statistics(
-    parquet_paths: list[Path], features: list[str] | None = None
+    parquet_paths: list[Path],
+    features: list[str] | None = None,
+    episode_indices: Iterable[int] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Calculate the dataset statistics of all columns for a list of parquet files.
 
@@ -143,11 +173,15 @@ def calculate_dataset_statistics(
         parquet_paths (list[Path]): List of paths to parquet files to process.
         features (list[str] | None): List of feature names to compute statistics for.
             If None, computes statistics for all columns in the data.
+        episode_indices (Iterable[int] | None): If given, only rows whose
+            ``episode_index`` is in this set are used. Needed for task subsets of
+            LeRobot v3.0 datasets, whose data files pack many episodes.
 
     Returns:
         dict[str, DatasetStatisticalValues]: Dictionary mapping feature names to their
             statistical values (mean, std, min, max, q01, q99).
     """
+    keep_episodes = None if episode_indices is None else set(int(i) for i in episode_indices)
     # Dataset statistics
     all_low_dim_data_list = []
     # Collect all the data
@@ -157,9 +191,15 @@ def calculate_dataset_statistics(
     ):
         # Load the parquet file
         parquet_data = pd.read_parquet(parquet_path)
-        parquet_data = parquet_data
+        if keep_episodes is not None:
+            parquet_data = parquet_data[parquet_data["episode_index"].isin(keep_episodes)]
         all_low_dim_data_list.append(parquet_data)
     all_low_dim_data = pd.concat(all_low_dim_data_list, axis=0)
+    if len(all_low_dim_data) == 0:
+        raise ValueError(
+            f"No rows to compute statistics from in {len(parquet_paths)} parquet file(s)"
+            + ("" if keep_episodes is None else f" for {len(keep_episodes)} selected episode(s)")
+        )
     # Compute dataset statistics
     dataset_statistics = {}
     if features is None:
@@ -229,15 +269,20 @@ def _stale_features(stats: dict | None, le_features: dict, lowdim_features: list
     return stale
 
 
-def check_stats_validity(dataset_path: Path | str, features: list[str]):
+def check_stats_validity(
+    dataset_path: Path | str,
+    features: list[str],
+    task_names: str | Iterable[str] | None = None,
+):
     """Return True iff every feature in ``features`` has a fingerprint-matching cached entry.
 
     A True result means ``generate_stats`` can skip recomputation entirely. We
     re-derive the expected fingerprint from the *current* ``info.json`` so any
-    schema drift since the cache was written invalidates it.
+    schema drift since the cache was written invalidates it. With ``task_names``
+    the task subset's own stats file is checked.
     """
     dataset_path = Path(dataset_path)
-    stats = _load_stats_cache(dataset_path / LE_ROBOT_STATS_FILENAME)
+    stats = _load_stats_cache(stats_file_path(dataset_path, task_names))
     if not stats:
         return False
     info_path = dataset_path / LE_ROBOT_INFO_FILENAME
@@ -248,14 +293,26 @@ def check_stats_validity(dataset_path: Path | str, features: list[str]):
     return not _stale_features(stats, le_features, features)
 
 
-def generate_stats(dataset_path: Path | str):
+def generate_stats(dataset_path: Path | str, task_names: str | Iterable[str] | None = None):
+    """Compute (or refresh stale entries of) the low-dim feature statistics of a dataset.
+
+    Without ``task_names`` every ``data/*/*.parquet`` row feeds ``meta/stats.json``.
+    With ``task_names`` only the selected tasks' episodes are used and the result is
+    written to ``meta/task_subsets/<key>/stats.json``, leaving the dataset-wide file
+    untouched (so e.g. training on one BEHAVIOR task inside the full 100-task root
+    neither reads 3 TB of parquet nor overwrites the shipped statistics).
+    """
     dataset_path = Path(dataset_path)
-    print(f"Generating stats for {str(dataset_path)}")
-    with open(dataset_path / LE_ROBOT_INFO_FILENAME, "r") as f:
-        le_features = json.load(f)["features"]
+    task_names = normalize_task_names(task_names)
+    print(
+        f"Generating stats for {str(dataset_path)}"
+        + ("" if task_names is None else f" (task subset {list(task_names)})")
+    )
+    info = load_lerobot_info(dataset_path)
+    le_features = info["features"]
     lowdim_features = [f for f in le_features if "float" in le_features[f]["dtype"]]
 
-    stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
+    stats_path = stats_file_path(dataset_path, task_names)
     existing = _load_stats_cache(stats_path)
     stale = _stale_features(existing, le_features, lowdim_features)
 
@@ -281,21 +338,45 @@ def generate_stats(dataset_path: Path | str):
     if not stale and not dropped:
         return
 
-    parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
-    fresh = calculate_dataset_statistics(parquet_files, stale) if stale else {}
+    fresh: dict[str, dict[str, float]] = {}
+    if task_names is None:
+        parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+        if stale:
+            fresh = calculate_dataset_statistics(parquet_files, stale)
+    else:
+        # Only the selected tasks' data files, restricted to their episodes' rows
+        # (v3.0 files may pack episodes of several tasks).
+        subset = select_task_subset(dataset_path, task_names, info=info)
+        parquet_files = subset_data_files(dataset_path, info, subset.episode_records)
+        print(
+            f"Task subset {list(task_names)}: {len(subset.episode_records)} episodes in "
+            f"{len(parquet_files)} data file(s)"
+        )
+        if stale:
+            fresh = calculate_dataset_statistics(
+                parquet_files, stale, episode_indices=subset.episode_indices
+            )
     for feature, values in fresh.items():
         existing[feature] = values
         fingerprints[feature] = _compute_stats_fingerprint(feature, le_features[feature])
 
     existing[STATS_FINGERPRINTS_KEY] = fingerprints
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
     _dump_stats_cache_atomic(stats_path, existing)
 
 
 class RelativeActionLoader:
-    def __init__(self, dataset_path: Path | str, embodiment_tag: EmbodimentTag, action_key: str):
+    def __init__(
+        self,
+        dataset_path: Path | str,
+        embodiment_tag: EmbodimentTag,
+        action_key: str,
+        task_names: str | Iterable[str] | None = None,
+    ):
         self.dataset_path = Path(dataset_path)
         self.modality_configs: dict[str, ModalityConfig] = {}
         self.action_key = action_key
+        self.task_names = normalize_task_names(task_names)
         # Check action config
         assert action_key in MODALITY_CONFIGS[embodiment_tag.value]["action"].modality_keys
         idx = MODALITY_CONFIGS[embodiment_tag.value]["action"].modality_keys.index(action_key)
@@ -318,7 +399,9 @@ class RelativeActionLoader:
             self.modality_configs["state"].delta_indices[-1]
             == self.modality_configs["action"].delta_indices[0]
         )
-        self.loader = LeRobotEpisodeLoader(dataset_path, self.modality_configs)
+        self.loader = LeRobotEpisodeLoader(
+            dataset_path, self.modality_configs, task_names=self.task_names
+        )
 
     def load_relative_actions(self, trajectory_id: int) -> list[np.ndarray]:
         df = self.loader[trajectory_id]
@@ -368,8 +451,9 @@ def calculate_stats_for_key(
     embodiment_tag: EmbodimentTag,
     group_key: str,
     max_episodes: int = -1,
+    task_names: str | Iterable[str] | None = None,
 ) -> dict:
-    loader = RelativeActionLoader(dataset_path, embodiment_tag, group_key)
+    loader = RelativeActionLoader(dataset_path, embodiment_tag, group_key, task_names=task_names)
     trajectories = []
     for episode_id in tqdm(range(len(loader)), desc=f"Loading trajectories for key {group_key}"):
         if max_episodes != -1 and episode_id >= max_episodes:
@@ -412,8 +496,15 @@ def _compute_relative_action_fingerprint(embodiment_tag: EmbodimentTag, action_k
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) -> None:
+def generate_rel_stats(
+    dataset_path: Path | str,
+    embodiment_tag: EmbodimentTag,
+    task_names: str | Iterable[str] | None = None,
+) -> None:
+    """Compute (or refresh) relative-action statistics; ``task_names`` restricts them to a
+    task subset and writes them to ``meta/task_subsets/<key>/relative_stats.json``."""
     dataset_path = Path(dataset_path)
+    task_names = normalize_task_names(task_names)
     action_config = MODALITY_CONFIGS[embodiment_tag.value]["action"]
     if action_config.action_configs is None:
         return
@@ -422,16 +513,24 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
         for key, action_config in zip(action_config.modality_keys, action_config.action_configs)
         if action_config.rep == ActionRepresentation.RELATIVE
     ]
-    stats_path = Path(dataset_path) / LE_ROBOT_REL_STATS_FILENAME
+    stats_path = rel_stats_file_path(dataset_path, task_names)
     stats = _load_stats_cache(stats_path)
     fingerprints = stats.setdefault(STATS_FINGERPRINTS_KEY, {})
     for action_key in sorted(action_keys):
         expected_fp = _compute_relative_action_fingerprint(embodiment_tag, action_key)
         if action_key in stats and fingerprints.get(action_key) == expected_fp:
             continue
-        print(f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}")
-        stats[action_key] = calculate_stats_for_key(dataset_path, embodiment_tag, action_key)
+        print(
+            f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}"
+            + ("" if task_names is None else f" (task subset {list(task_names)})")
+        )
+        # Keep the stock call signature when no subset is requested.
+        subset_kwargs = {} if task_names is None else {"task_names": task_names}
+        stats[action_key] = calculate_stats_for_key(
+            dataset_path, embodiment_tag, action_key, **subset_kwargs
+        )
         fingerprints[action_key] = expected_fp
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
     _dump_stats_cache_atomic(stats_path, to_json_serializable(dict(stats)))
 
 
@@ -439,6 +538,7 @@ def main(
     dataset_path: Path | str,
     embodiment_tag: EmbodimentTag,
     modality_config_path: str | None = None,
+    task_names: list[str] | None = None,
 ):
     """Generate dataset statistics.
 
@@ -447,6 +547,8 @@ def main(
         embodiment_tag: Embodiment tag for modality configurations.
         modality_config_path: Optional path to a .py modality config file. Required for custom
             embodiment tags not in the built-in MODALITY_CONFIGS registry.
+        task_names: Optional task subset (task strings of ``meta/tasks.parquet`` /
+            ``meta/tasks.jsonl``); stats then go to ``meta/task_subsets/<key>/``.
     """
     if modality_config_path is not None:
         import importlib
@@ -461,8 +563,8 @@ def main(
             raise FileNotFoundError(
                 f"Modality config path does not exist or is not a .py file: {modality_config_path}"
             )
-    generate_stats(dataset_path)
-    generate_rel_stats(dataset_path, embodiment_tag)
+    generate_stats(dataset_path, task_names=task_names)
+    generate_rel_stats(dataset_path, embodiment_tag, task_names=task_names)
 
 
 if __name__ == "__main__":

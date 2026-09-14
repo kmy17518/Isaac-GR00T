@@ -33,11 +33,14 @@ Returns messages with VLAStepData as defined in types.py.
 """
 
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+import hashlib
 import json
 import logging
 from pathlib import Path
 import random
-from typing import Any
+import re
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -63,6 +66,16 @@ LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 # meta/ and replace episodes.jsonl / tasks.jsonl when codebase_version >= v3.0.
 LEROBOT_V30_EPISODES_DIR_NAME = "episodes"
 LEROBOT_V30_TASKS_FILENAME = "tasks.parquet"
+
+# A loader restricted to a *task subset* (``task_names``) keeps its normalization
+# statistics under ``meta/task_subsets/<key>/`` (``stats.json`` /
+# ``relative_stats.json``), so training on one task of a multi-task dataset never
+# overwrites the dataset-wide ``meta/stats.json`` with per-task numbers, and
+# different subsets of the same root do not clobber each other.
+LEROBOT_TASK_SUBSETS_DIR_NAME = "task_subsets"
+_TASK_SUBSET_KEY_SEPARATOR = "+"
+_TASK_SUBSET_KEY_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
+_TASK_SUBSET_KEY_MAX_LEN = 96
 
 # Optional per-key fields of the ``annotation`` section of ``meta/modality.json``.
 # A language key ``annotation.<subkey>`` reads an integer task index from the data
@@ -108,6 +121,273 @@ def _to_plain_dict(tree):
     return tree
 
 
+# ---------------------------------------------------------------------------
+# Task subsets
+#
+# ``task_names`` restricts a dataset to the episodes of some of its tasks, e.g. one
+# BEHAVIOR task inside the full 100-task ``2026-challenge-demos`` root. The helpers
+# below work from ``meta/`` alone (no ``modality.json`` / ``stats.json`` needed) so
+# ``gr00t.data.stats`` can compute subset statistics before a loader exists, and
+# ``LeRobotEpisodeLoader`` reuses them so both agree on the episode set.
+# ---------------------------------------------------------------------------
+
+
+def normalize_task_names(task_names: str | Iterable[str] | None) -> tuple[str, ...] | None:
+    """Canonical ``task_names`` value: sorted unique tuple, or ``None`` for "all tasks"."""
+    if task_names is None:
+        return None
+    if isinstance(task_names, str):
+        task_names = [task_names]
+    names = tuple(sorted({str(name) for name in task_names}))
+    return names or None
+
+
+def task_subset_key(task_names: str | Iterable[str]) -> str:
+    """Directory name under ``meta/task_subsets/`` for a task subset.
+
+    Human-readable (``picking_up_trash+turning_on_radio``) when the names are short
+    filesystem-safe identifiers, a content hash otherwise.
+    """
+    names = normalize_task_names(task_names)
+    if names is None:
+        raise ValueError("task_subset_key needs at least one task name")
+    joined = _TASK_SUBSET_KEY_SEPARATOR.join(names)
+    if len(joined) <= _TASK_SUBSET_KEY_MAX_LEN and all(
+        _TASK_SUBSET_KEY_SAFE_NAME.fullmatch(name) for name in names
+    ):
+        return joined
+    digest = hashlib.sha256("\0".join(names).encode("utf-8")).hexdigest()[:16]
+    return f"sha256-{digest}"
+
+
+def task_subset_stats_dir(dataset_path: str | Path, task_names: str | Iterable[str] | None) -> Path:
+    """Where a (possibly task-restricted) loader reads / writes its stats files.
+
+    ``meta/`` for the whole dataset (stock layout), ``meta/task_subsets/<key>/`` for a
+    task subset.
+    """
+    meta_dir = Path(dataset_path) / LEROBOT_META_DIR_NAME
+    names = normalize_task_names(task_names)
+    if names is None:
+        return meta_dir
+    return meta_dir / LEROBOT_TASK_SUBSETS_DIR_NAME / task_subset_key(names)
+
+
+def parse_lerobot_major_version(codebase_version: str) -> int:
+    """Extract the integer major version from a ``vX.Y`` codebase string (``2`` if unparsable)."""
+    digits = str(codebase_version).lstrip("vV").split(".")[0]
+    try:
+        return int(digits)
+    except ValueError:
+        return 2
+
+
+def load_lerobot_info(dataset_path: str | Path) -> dict[str, Any]:
+    """Parse ``meta/info.json``."""
+    with open(Path(dataset_path) / LEROBOT_META_DIR_NAME / LEROBOT_INFO_FILENAME, "r") as f:
+        return json.load(f)
+
+
+def is_lerobot_v30(info: dict[str, Any]) -> bool:
+    return parse_lerobot_major_version(info.get("codebase_version", "v2.1")) >= 3
+
+
+def load_lerobot_episode_records(
+    dataset_path: str | Path, info: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """All episode metadata rows, sorted by ``episode_index``.
+
+    v3.0: consolidated ``meta/episodes/chunk-*/file-*.parquet`` (the heavy
+    per-episode ``stats/*`` columns are skipped -- they are not needed for loading and
+    inflate memory). v2.x: one JSON object per line of ``meta/episodes.jsonl``.
+    """
+    dataset_path = Path(dataset_path)
+    info = load_lerobot_info(dataset_path) if info is None else info
+    meta_dir = dataset_path / LEROBOT_META_DIR_NAME
+    if is_lerobot_v30(info):
+        episodes_dir = meta_dir / LEROBOT_V30_EPISODES_DIR_NAME
+        pq_paths = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
+        if not pq_paths:
+            raise FileNotFoundError(
+                f"No episode parquet files found under {episodes_dir} for v3.0 dataset "
+                f"{dataset_path}"
+            )
+        records: list[dict[str, Any]] = []
+        for pq_path in pq_paths:
+            schema_names = pq.ParquetFile(pq_path).schema_arrow.names
+            columns = [name for name in schema_names if not name.startswith("stats/")]
+            records.extend(pq.read_table(pq_path, columns=columns).to_pylist())
+    else:
+        with open(meta_dir / LEROBOT_EPISODES_FILENAME, "r") as f:
+            records = [json.loads(line) for line in f]
+    records.sort(key=lambda record: int(record["episode_index"]))
+    return records
+
+
+def load_lerobot_tasks_table(dataset_path: str | Path, filename: str) -> dict[int, dict[str, Any]]:
+    """Load ``meta/<filename>`` as a ``task_index -> row`` table.
+
+    Supports both LeRobot layouts: JSONL (v2.x ``tasks.jsonl``, one object per line,
+    possibly carrying extra text fields next to ``task``) and v3.0 parquet, where the
+    task string may be either a regular ``task`` column or the (named) index depending
+    on the writer; both are normalized here.
+    """
+    path = Path(dataset_path) / LEROBOT_META_DIR_NAME / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Tasks table {path} does not exist for {dataset_path}")
+    if path.suffix == ".parquet":
+        tasks_df = pq.read_table(path).to_pandas()
+        if tasks_df.index.name == DEFAULT_TASK_FIELD:
+            tasks_df = tasks_df.reset_index()
+        rows = tasks_df.to_dict(orient="records")
+    elif path.suffix == ".jsonl":
+        with open(path, "r") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    else:
+        raise ValueError(f"Unsupported tasks table format {path.suffix!r}: {path}")
+    return {int(row["task_index"]): row for row in rows}
+
+
+def canonical_tasks_filename(info: dict[str, Any]) -> str:
+    """The stock LeRobot tasks table of a dataset version."""
+    return LEROBOT_V30_TASKS_FILENAME if is_lerobot_v30(info) else LEROBOT_TASKS_FILENAME
+
+
+def select_task_indices(
+    tasks_table: dict[int, dict[str, Any]], task_names: Iterable[str]
+) -> frozenset[int]:
+    """Resolve task selectors to ``task_index`` values through the canonical tasks table.
+
+    A selector matches a row when it equals any string field of that row: LeRobot's
+    ``task`` string (for the BEHAVIOR v3.0 demos that is the snake_case task name),
+    or -- for tables carrying extra text per task, like the v2.1 conversion of those
+    demos -- ``task_name`` / the natural-language ``task`` description. Unknown
+    selectors raise ``ValueError`` listing the available task strings.
+    """
+    selected: set[int] = set()
+    unknown: list[str] = []
+    for name in normalize_task_names(task_names) or ():
+        matches = {
+            task_index
+            for task_index, row in tasks_table.items()
+            if any(
+                key != "task_index" and isinstance(value, str) and value == name
+                for key, value in row.items()
+            )
+        }
+        if matches:
+            selected |= matches
+        else:
+            unknown.append(name)
+    if unknown:
+        available = sorted(
+            str(row.get(DEFAULT_TASK_FIELD, task_index)) for task_index, row in tasks_table.items()
+        )
+        shown = ", ".join(available[:20]) + (
+            f", ... ({len(available)} tasks total)" if len(available) > 20 else ""
+        )
+        raise ValueError(f"Unknown task(s) {unknown}; the dataset's tasks table has: {shown}")
+    return frozenset(selected)
+
+
+def select_episode_records(
+    records: Iterable[dict[str, Any]],
+    task_indices: frozenset[int] | set[int],
+    task_strings: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Episode records belonging to the selected tasks.
+
+    Matches on the record's ``task_index`` when present (the BEHAVIOR demos carry it,
+    in v3.0 and after the v2.1 conversion), else on LeRobot's per-episode ``tasks``
+    strings against the selected tasks' canonical strings.
+    """
+    task_strings = set(task_strings)
+    selected: list[dict[str, Any]] = []
+    for record in records:
+        task_index = record.get("task_index")
+        if task_index is not None:
+            if int(task_index) in task_indices:
+                selected.append(record)
+        elif task_strings & {str(task) for task in (record.get("tasks") or ())}:
+            selected.append(record)
+    return selected
+
+
+@dataclass(frozen=True)
+class TaskSubset:
+    """Episodes of a dataset restricted to ``task_names`` (see :func:`select_task_subset`)."""
+
+    task_names: tuple[str, ...]
+    task_indices: frozenset[int]
+    episode_records: list[dict[str, Any]]
+
+    @property
+    def episode_indices(self) -> list[int]:
+        return [int(record["episode_index"]) for record in self.episode_records]
+
+
+def select_task_subset(
+    dataset_path: str | Path,
+    task_names: str | Iterable[str],
+    info: dict[str, Any] | None = None,
+    records: list[dict[str, Any]] | None = None,
+) -> TaskSubset:
+    """Resolve ``task_names`` on a dataset root, from its ``meta/`` files alone.
+
+    Raises ``ValueError`` if a selector is unknown or no episode belongs to the
+    selected tasks (e.g. a partial download that holds other tasks).
+    """
+    dataset_path = Path(dataset_path)
+    names = normalize_task_names(task_names)
+    if names is None:
+        raise ValueError("select_task_subset needs at least one task name")
+    info = load_lerobot_info(dataset_path) if info is None else info
+    tasks_table = load_lerobot_tasks_table(dataset_path, canonical_tasks_filename(info))
+    task_indices = select_task_indices(tasks_table, names)
+    task_strings = {str(tasks_table[i][DEFAULT_TASK_FIELD]) for i in task_indices}
+    records = load_lerobot_episode_records(dataset_path, info) if records is None else records
+    selected = select_episode_records(records, task_indices, task_strings)
+    if not selected:
+        raise ValueError(
+            f"No episodes of task(s) {list(names)} in {dataset_path} "
+            f"({len(records)} episodes present); is this a partial download of other tasks?"
+        )
+    return TaskSubset(task_names=names, task_indices=task_indices, episode_records=selected)
+
+
+def subset_data_files(
+    dataset_path: str | Path, info: dict[str, Any], records: Iterable[dict[str, Any]]
+) -> list[Path]:
+    """Data parquet files holding the given episode records (sorted, de-duplicated).
+
+    v3.0 files pack many episodes; callers that need exactly the subset's rows must
+    additionally filter on ``episode_index`` (see ``TaskSubset.episode_indices``).
+    """
+    dataset_path = Path(dataset_path)
+    data_path_pattern = info["data_path"]
+    files: set[Path] = set()
+    if is_lerobot_v30(info):
+        for record in records:
+            files.add(
+                dataset_path
+                / data_path_pattern.format(
+                    chunk_index=int(record["data/chunk_index"]),
+                    file_index=int(record["data/file_index"]),
+                )
+            )
+    else:
+        chunk_size = int(info["chunks_size"])
+        for record in records:
+            episode_index = int(record["episode_index"])
+            files.add(
+                dataset_path
+                / data_path_pattern.format(
+                    episode_chunk=episode_index // chunk_size, episode_index=episode_index
+                )
+            )
+    return sorted(files)
+
+
 class LeRobotEpisodeLoader:
     """
     Episode-level data loader for LeRobot format datasets.
@@ -129,6 +409,9 @@ class LeRobotEpisodeLoader:
                          that specify temporal sampling and data keys to load
         video_backend: Video decoding backend ('torchcodec', 'decord', etc.)
         video_backend_kwargs: Additional arguments for the video backend
+        task_names: Optional task subset: only episodes of these tasks are exposed
+                    (see :func:`select_task_subset`; stats are then read from
+                    :func:`task_subset_stats_dir`). ``None`` loads every episode.
 
     Example:
         >>> loader = LeRobotEpisodeLoader(
@@ -152,6 +435,7 @@ class LeRobotEpisodeLoader:
         video_backend_kwargs: dict[str, Any] | None = None,
         data_cache_size: int | None = None,
         video_cache_size: int | None = None,
+        task_names: str | Iterable[str] | None = None,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -167,10 +451,15 @@ class LeRobotEpisodeLoader:
                 ``None`` defaults to the data-file count (capped). Ignored for v2.x.
             video_cache_size: Max v3.0 video decoders to keep cached.
                 ``None`` defaults to the video-file count (capped). Ignored for v2.x.
+            task_names: Restrict the loader to the episodes of these tasks (matched
+                through the canonical tasks table, see :func:`select_task_indices`).
+                Episode indices passed to :meth:`load_episode` then address the
+                filtered list. ``None`` (default) exposes every episode.
         """
         self.dataset_path = Path(dataset_path)
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs
+        self.task_names = normalize_task_names(task_names)
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -200,28 +489,25 @@ class LeRobotEpisodeLoader:
         - episodes.jsonl (v2.x) / episodes/*.parquet (v3.0): Per-episode metadata
         - tasks.jsonl (v2.x) / tasks.parquet (v3.0): Task index -> text mappings
         - modality.json: Modality structure and data layout
-        - stats.json: Dataset statistics for normalization
+        - stats.json: Dataset statistics for normalization (from ``self.stats_dir``:
+          ``meta/`` or, for a task subset, ``meta/task_subsets/<key>/``)
         """
         meta_dir = self.dataset_path / LEROBOT_META_DIR_NAME
 
         # Load dataset configuration
-        info_path = meta_dir / LEROBOT_INFO_FILENAME
-        with open(info_path, "r") as f:
-            self.info_meta = json.load(f)
+        self.info_meta = load_lerobot_info(self.dataset_path)
 
         # Detect the LeRobot dataset codebase version
         self.codebase_version = str(self.info_meta.get("codebase_version", "v2.1"))
         self.is_v30 = self._parse_major_version(self.codebase_version) >= 3
+        self.tasks_filename = canonical_tasks_filename(self.info_meta)
 
-        if self.is_v30:
-            self.episodes_metadata = self._load_episodes_metadata_v30(meta_dir)
-            self.tasks_filename = LEROBOT_V30_TASKS_FILENAME
-        else:
-            # Load episode metadata (one episode per line)
-            episodes_path = meta_dir / LEROBOT_EPISODES_FILENAME
-            with open(episodes_path, "r") as f:
-                self.episodes_metadata = [json.loads(line) for line in f]
-            self.tasks_filename = LEROBOT_TASKS_FILENAME
+        # Every episode of the dataset (v3.0 parquet shards / v2.x episodes.jsonl).
+        # Kept unfiltered: v3.0 file row offsets must be computed over *all* episodes
+        # of a data file, whichever subset is loaded (see ``_init_v30_caches``).
+        self._all_episodes_metadata = load_lerobot_episode_records(
+            self.dataset_path, self.info_meta
+        )
 
         # Canonical task-index -> task-string map (LeRobot's ``task`` field). Extra
         # tasks tables / text fields referenced by modality.json annotation keys
@@ -234,6 +520,24 @@ class LeRobotEpisodeLoader:
             for task_index, row in self._get_tasks_table(self.tasks_filename).items()
         }
 
+        # Optional task subset: keep only the episodes of ``task_names``.
+        if self.task_names is not None:
+            subset = select_task_subset(
+                self.dataset_path,
+                self.task_names,
+                info=self.info_meta,
+                records=self._all_episodes_metadata,
+            )
+            self.task_indices: frozenset[int] | None = subset.task_indices
+            self.episodes_metadata = subset.episode_records
+            logging.info(
+                f"Task subset {list(self.task_names)} -> {len(self.episodes_metadata)}/"
+                f"{len(self._all_episodes_metadata)} episodes of {self.dataset_path}"
+            )
+        else:
+            self.task_indices = None
+            self.episodes_metadata = self._all_episodes_metadata
+
         # Index episode records by their episode_index
         self._episode_by_index = {int(ep["episode_index"]): ep for ep in self.episodes_metadata}
 
@@ -242,15 +546,17 @@ class LeRobotEpisodeLoader:
         with open(modality_path, "r") as f:
             self.modality_meta = json.load(f)
 
-        # Load dataset statistics for normalization
-        stats_path = meta_dir / LEROBOT_STATS_FILE_NAME
+        # Load dataset statistics for normalization. A task subset has its own
+        # stats directory so per-task numbers never overwrite the dataset-wide ones.
+        self.stats_dir = task_subset_stats_dir(self.dataset_path, self.task_names)
+        stats_path = self.stats_dir / LEROBOT_STATS_FILE_NAME
         assert stats_path.exists(), (
             f"{stats_path} does not exist for {self.dataset_path}, please use gr00t/data/stats.py to generate it"
         )
         with open(stats_path, "r") as f:
             self.stats = json.load(f)
 
-        relative_stats_path = meta_dir / LEROBOT_RELATIVE_STATS_FILE_NAME
+        relative_stats_path = self.stats_dir / LEROBOT_RELATIVE_STATS_FILE_NAME
         if relative_stats_path.exists():
             with open(relative_stats_path, "r") as f:
                 relative_stats = json.load(f)
@@ -270,60 +576,20 @@ class LeRobotEpisodeLoader:
 
     @staticmethod
     def _parse_major_version(codebase_version: str) -> int:
-        """Extract the integer major version from a ``vX.Y`` codebase string.
-        """
-        digits = codebase_version.lstrip("vV").split(".")[0]
-        try:
-            return int(digits)
-        except ValueError:
-            return 2
+        """Extract the integer major version from a ``vX.Y`` codebase string."""
+        return parse_lerobot_major_version(codebase_version)
 
     def _load_episodes_metadata_v30(self, meta_dir: Path) -> list[dict[str, Any]]:
         """Load consolidated per-episode metadata rows from ``meta/episodes/``.
 
-        v3.0 stores episode metadata as parquet (one row per episode) holding the
-        data-file location (``data/chunk_index``, ``data/file_index``,
-        ``dataset_from_index``, ``dataset_to_index``) and, per video key, the
-        containing file and its time span. The heavy per-episode ``stats/*``
-        columns are skipped — they are not needed for loading and inflate memory.
+        See :func:`load_lerobot_episode_records`; kept for callers that use this
+        method directly.
         """
-        episodes_dir = meta_dir / LEROBOT_V30_EPISODES_DIR_NAME
-        pq_paths = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
-        if not pq_paths:
-            raise FileNotFoundError(
-                f"No episode parquet files found under {episodes_dir} for v3.0 dataset "
-                f"{self.dataset_path}"
-            )
-        records: list[dict[str, Any]] = []
-        for pq_path in pq_paths:
-            schema_names = pq.ParquetFile(pq_path).schema_arrow.names
-            columns = [name for name in schema_names if not name.startswith("stats/")]
-            records.extend(pq.read_table(pq_path, columns=columns).to_pylist())
-        records.sort(key=lambda record: int(record["episode_index"]))
-        return records
+        return load_lerobot_episode_records(meta_dir.parent, self.info_meta)
 
     def _load_tasks_table(self, filename: str) -> dict[int, dict[str, Any]]:
-        """Load ``meta/<filename>`` as a ``task_index -> row`` table.
-
-        Supports both LeRobot layouts: JSONL (v2.x ``tasks.jsonl``, one object per
-        line, possibly carrying extra text fields next to ``task``) and v3.0
-        parquet, where the task string may be either a regular ``task`` column or
-        the (named) index depending on the writer; both are normalized here.
-        """
-        path = self.dataset_path / LEROBOT_META_DIR_NAME / filename
-        if not path.exists():
-            raise FileNotFoundError(f"Tasks table {path} does not exist for {self.dataset_path}")
-        if path.suffix == ".parquet":
-            tasks_df = pq.read_table(path).to_pandas()
-            if tasks_df.index.name == DEFAULT_TASK_FIELD:
-                tasks_df = tasks_df.reset_index()
-            rows = tasks_df.to_dict(orient="records")
-        elif path.suffix == ".jsonl":
-            with open(path, "r") as f:
-                rows = [json.loads(line) for line in f if line.strip()]
-        else:
-            raise ValueError(f"Unsupported tasks table format {path.suffix!r}: {path}")
-        return {int(row["task_index"]): row for row in rows}
+        """Load ``meta/<filename>`` as a ``task_index -> row`` table (v2.x JSONL or v3.0 parquet)."""
+        return load_lerobot_tasks_table(self.dataset_path, filename)
 
     def _get_tasks_table(self, filename: str) -> dict[int, dict[str, Any]]:
         """Cached :meth:`_load_tasks_table`."""
@@ -371,15 +637,23 @@ class LeRobotEpisodeLoader:
         """
         self._data_columns = self._compute_needed_data_columns()
 
-        # Base (minimum global row index) per data file → within-file offsets.
+        # Base (minimum global row index) per data file → within-file offsets. Computed
+        # over *every* episode of the dataset, not just a task subset: a file's first
+        # row belongs to whichever episode comes first in it, selected or not.
         self._file_row_base: dict[tuple[int, int], int] = {}
-        for ep in self.episodes_metadata:
+        for ep in self._all_episodes_metadata:
             key = (int(ep["data/chunk_index"]), int(ep["data/file_index"]))
             frm = int(ep["dataset_from_index"])
             cur = self._file_row_base.get(key)
             self._file_row_base[key] = frm if cur is None else min(cur, frm)
 
-        n_data_files = len(self._file_row_base)
+        # Cache sizing only counts the files the (possibly filtered) episodes touch.
+        n_data_files = len(
+            {
+                (int(ep["data/chunk_index"]), int(ep["data/file_index"]))
+                for ep in self.episodes_metadata
+            }
+        )
         self._table_cache_size = (
             data_cache_size if data_cache_size is not None else max(1, min(n_data_files, 64))
         )
