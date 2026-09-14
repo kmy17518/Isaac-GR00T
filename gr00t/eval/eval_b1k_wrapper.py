@@ -67,7 +67,7 @@ def _slice_batch(batch, indices):
 
     process_input() returns a nested structure:
         {"video": {cam: (B,T,H,W,C)}, "state": {key: (B,T,D)},
-         "language": {"...": [[p_0, ..., p_{B-1}]]}}
+         "language": {"...": [[p_0], ..., [p_{B-1}]]}}
     Sub-batching (selecting the env slots that need inference) must recurse into the nested dicts and
     slice arrays / the language list by ``indices``. A plain top-level ``v[indices]`` fails because the
     top-level values are dicts, not arrays (``dict[ndarray]`` -> "unhashable type: numpy.ndarray").
