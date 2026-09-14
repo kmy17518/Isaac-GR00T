@@ -52,6 +52,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Batched (bitwise-identical) Qwen3-VL position-id / vision position computations instead of
     # the stock per-sample / per-image Python loops, which make large batches CPU-bound.
     fast_vl_position_ids: bool = True
+    # Run the Qwen3-VL vision patch embedding (a Conv3d whose kernel is the whole patch) as the
+    # equivalent F.linear -- same math; cuDNN's kernel for that convolution is ~50x slower on Blackwell.
+    fast_vl_patch_embed: bool = True
     # How the data collator emits `pixel_values` (None = the VLM processor's float32). "bfloat16":
     # normalized patches in bf16 (half the host/shm/H2D traffic; bit-identical whenever the vision
     # tower computes in bf16). "uint8": unnormalized uint8 patches (a quarter of the bytes), with the

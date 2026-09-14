@@ -98,6 +98,7 @@ class Qwen3Backbone(torch.nn.Module):
         trainable_params_fp32: bool = False,
         transformers_loading_kwargs: dict = {},
         fast_vl_position_ids: bool = True,
+        fast_vl_patch_embed: bool = True,
     ):
         """
         Qwen3Backbone is to generate n_queries to represent the future action hidden states.
@@ -109,6 +110,8 @@ class Qwen3Backbone(torch.nn.Module):
                 M-RoPE position ids and vision position tables with batched, bitwise-identical
                 implementations (gr00t.model.modules.qwen3_vl_fast_positions). Large batches
                 are otherwise CPU-bound on those loops.
+            fast_vl_patch_embed: run the vision patch embedding (a Conv3d whose kernel is the whole
+                patch) as the equivalent F.linear; cuDNN's kernel for it is ~50x slower on Blackwell.
         """
         if not _QWEN3VL_AVAILABLE:
             raise ImportError(
@@ -140,6 +143,14 @@ class Qwen3Backbone(torch.nn.Module):
             **extra_kwargs,
             **transformers_loading_kwargs,
         ).eval()
+
+        if fast_vl_patch_embed:
+            from gr00t.model.modules.qwen3_vl_fast_patch_embed import (
+                apply_fast_qwen3_vl_patch_embed,
+            )
+
+            if apply_fast_qwen3_vl_patch_embed(self.model):
+                logger.info("Qwen3-VL: patch embedding as F.linear (degenerate Conv3d)")
 
         if fast_vl_position_ids:
             from gr00t.model.modules.qwen3_vl_fast_positions import apply_fast_qwen3_vl_positions
