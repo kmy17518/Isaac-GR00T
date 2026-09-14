@@ -156,6 +156,10 @@ class Qwen3Backbone(torch.nn.Module):
             self.model.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        # forward() reads the last kept decoder layer's (pre-norm) output through this hook, so the
+        # base Qwen3VLModel can be run without the lm_head (registered after the truncation above).
+        self._last_layer_output: torch.Tensor | None = None
+        self.model.model.language_model.layers[-1].register_forward_hook(self._capture_last_layer)
         # Set by Gr00tN1d7 from its image processor; used when the collator ships uint8 patches.
         self.pixel_patch_normalizer: PixelPatchNormalizer | None = None
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
@@ -205,6 +209,9 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _capture_last_layer(self, module, inputs, output) -> None:
+        self._last_layer_output = output[0] if isinstance(output, tuple) else output
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
@@ -218,11 +225,15 @@ class Qwen3Backbone(torch.nn.Module):
                     "uint8 pixel_values need Qwen3Backbone.pixel_patch_normalizer (set by Gr00tN1d7)"
                 )
             vl_input["pixel_values"] = self.pixel_patch_normalizer(vl_input["pixel_values"])
-        # Only hidden_states[-1] (the pre-norm output of the last kept decoder layer) is used;
-        # logits_to_keep=1 skips the lm_head over the full sequence -- (B, L, 151k) logits that
-        # were computed, written and discarded every step -- without touching hidden_states.
-        outputs = self.model(**vl_input, output_hidden_states=True, logits_to_keep=1)
-        outputs = outputs.hidden_states[-1]
+        # Only the pre-norm output of the last kept decoder layer is used (== the causal-LM wrapper's
+        # hidden_states[-1]). Capture it with a hook while running the base Qwen3VLModel, which skips
+        # the lm_head entirely: even with logits_to_keep=1 the (B, 151k-vocab) GEMM cost ~90 ms per
+        # 1024-sample step on B300 (cuBLAS has no good kernel for that shape).
+        self._last_layer_output = None
+        self.model.model(**vl_input)
+        outputs, self._last_layer_output = self._last_layer_output, None
+        if outputs is None:
+            raise RuntimeError("Qwen3Backbone: last decoder layer output was not captured")
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
         return BatchFeature(
