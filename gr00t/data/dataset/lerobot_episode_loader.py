@@ -67,6 +67,12 @@ LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 LEROBOT_V30_EPISODES_DIR_NAME = "episodes"
 LEROBOT_V30_TASKS_FILENAME = "tasks.parquet"
 
+# Per-process caps on the v3.0 per-file caches (see ``_init_v30_caches``): each
+# cached table is ~115 MiB and each open decoder ~40 MiB on the BEHAVIOR demos, and
+# every dataloader worker holds its own caches.
+DEFAULT_V30_TABLE_CACHE_SIZE = 4
+DEFAULT_V30_VIDEO_CACHE_SIZE = 8
+
 # A loader restricted to a *task subset* (``task_names``) keeps its normalization
 # statistics under ``meta/task_subsets/<key>/`` (``stats.json`` /
 # ``relative_stats.json``), so training on one task of a multi-task dataset never
@@ -447,10 +453,13 @@ class LeRobotEpisodeLoader:
         4. (v3.0 only) Setting up the per-file parquet/video caches
 
         Args:
-            data_cache_size: Max v3.0 data parquet tables to keep cached.
-                ``None`` defaults to the data-file count (capped). Ignored for v2.x.
-            video_cache_size: Max v3.0 video decoders to keep cached.
-                ``None`` defaults to the video-file count (capped). Ignored for v2.x.
+            data_cache_size: Max v3.0 data parquet tables to keep cached per
+                process. ``None`` defaults to ``min(files touched, 4)``; caches
+                are per dataloader worker, so keep this small on many-file
+                datasets (see ``_init_v30_caches``). Ignored for v2.x.
+            video_cache_size: Max v3.0 video decoders to keep cached per
+                process. ``None`` defaults to ``min(videos touched, 8)``.
+                Ignored for v2.x.
             task_names: Restrict the loader to the episodes of these tasks (matched
                 through the canonical tasks table, see :func:`select_task_indices`).
                 Episode indices passed to :meth:`load_episode` then address the
@@ -632,8 +641,20 @@ class LeRobotEpisodeLoader:
         """Set up the v3.0 per-file parquet table cache and video decoder pool.
 
         Precomputes the projected data columns and each file's base global row
-        index (to map an episode's global range to a within-file slice). Cache
-        sizes default to the file counts (capped) for order-independent reuse.
+        index (to map an episode's global range to a within-file slice).
+
+        Default cache sizes are bounded by the shard access pattern, not the file
+        count. A shard mixes a handful of episode sub-sequences (~5 at
+        ``episode_sampling_rate=0.1``), loaded one episode at a time: an episode
+        reads its data table once and one decoder per camera, so nothing still in
+        use is ever evicted with >= 1 table and >= n_cameras decoders live. Reuse
+        across shards is only likely when the dataset (or task subset) spans few
+        files, which small defaults already cover. The caches are per
+        dataloader-worker process: on the 100-task BEHAVIOR root (955 data files
+        of ~115 MiB in memory each, ~40 MiB per open decoder) the former defaults
+        of 64 tables / 32 decoders let every worker grow to ~8.5 GiB over the first
+        few hundred shards -- ~540 GiB for 8 GPUs x 8 workers -- for a cross-shard
+        hit rate of a few percent; a missed table costs ~0.15 s to re-read.
         """
         self._data_columns = self._compute_needed_data_columns()
 
@@ -655,14 +676,16 @@ class LeRobotEpisodeLoader:
             }
         )
         self._table_cache_size = (
-            data_cache_size if data_cache_size is not None else max(1, min(n_data_files, 64))
+            data_cache_size
+            if data_cache_size is not None
+            else max(1, min(n_data_files, DEFAULT_V30_TABLE_CACHE_SIZE))
         )
 
         n_video_files = self._count_v30_video_files()
         pool_size = (
             video_cache_size
             if video_cache_size is not None
-            else max(1, min(n_video_files or 1, 32))
+            else max(1, min(n_video_files or 1, DEFAULT_V30_VIDEO_CACHE_SIZE))
         )
         self._video_pool = VideoReaderPool(
             self.video_backend,
