@@ -17,6 +17,7 @@ from collections import OrderedDict
 import json
 import logging
 import math
+import os
 import shutil
 import subprocess
 from typing import List, Optional, Tuple
@@ -51,6 +52,14 @@ _GET_ALL_FRAMES_BACKENDS: tuple[str, ...] = (
     "ffmpeg",
     "pyav",
 )
+
+
+def torchcodec_threads() -> int:
+    """FFmpeg decoder threads per torchcodec decoder (``GR00T_FFMPEG_THREADS``; default 0 = FFmpeg's
+    auto, up to 16 per decoder). With many dataloader workers on a CPU quota the auto setting
+    oversubscribes the cores (e.g. 48 workers x 16 threads on 130 cores); 2-4 per worker keeps the
+    same decode result with far fewer context switches."""
+    return int(os.environ.get("GR00T_FFMPEG_THREADS", "0"))
 
 
 def _unsupported_backend_error(
@@ -412,7 +421,10 @@ def get_frames_by_indices(
     if video_backend == "torchcodec":
         torchcodec = _lazy_import_torchcodec()
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path,
+            device="cpu",
+            dimension_order="NHWC",
+            num_ffmpeg_threads=torchcodec_threads(),
         )
         return decoder.get_frames_at(indices=indices).data.numpy()
     elif video_backend == "decord":
@@ -460,7 +472,10 @@ def get_frames_by_timestamps(
     if video_backend == "torchcodec":
         torchcodec = _lazy_import_torchcodec()
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path,
+            device="cpu",
+            dimension_order="NHWC",
+            num_ffmpeg_threads=torchcodec_threads(),
         )
 
         # https://docs.pytorch.org/torchcodec/stable/generated/torchcodec.decoders.VideoStreamMetadata.html#torchcodec.decoders.VideoStreamMetadata
@@ -578,7 +593,10 @@ def get_all_frames(
     if video_backend == "torchcodec":
         torchcodec = _lazy_import_torchcodec()
         decoder = torchcodec.decoders.VideoDecoder(
-            video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+            video_path,
+            device="cpu",
+            dimension_order="NHWC",
+            num_ffmpeg_threads=torchcodec_threads(),
         )
         frames = decoder.get_frames_at(indices=range(len(decoder)))
         return frames.data.numpy(), frames.pts_seconds.numpy()
@@ -685,7 +703,10 @@ class VideoReaderPool:
         if backend == "torchcodec":
             torchcodec = _lazy_import_torchcodec()
             reader = torchcodec.decoders.VideoDecoder(
-                video_path, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+                video_path,
+                device="cpu",
+                dimension_order="NHWC",
+                num_ffmpeg_threads=torchcodec_threads(),
             )
         elif backend == "decord":
             decord = _lazy_import_decord()
