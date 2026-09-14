@@ -50,6 +50,23 @@ cd $PATH_TO_BEHAVIOR_1K
   export LD_LIBRARY_PATH="$(python -c 'import site; print(site.getsitepackages()[0])')/nvidia/cuda_nvrtc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   ```
 
+- **`torch.compile` on B300 needs a CUDA 13 build of PyTorch.** The pinned torch 2.7.1+cu128 ships Triton 3.3.1, whose LLVM has no `sm_103` target (`LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.shfl.sync.bfly.i32`), and `sm_100a` binaries are architecture-locked (`no kernel image is available for execution on the device`), so `--compile-blocks` cannot run in the default environment. It does with `torch==2.10.0+cu130` (Triton 3.6; Linux aarch64 wheels exist for Python 3.10 and 3.12 at `https://download.pytorch.org/whl/cu130`, driver ≥ 580). Because the aarch64 `flash-attn` and `torchcodec` wheels in `scripts/deployment/dgpu/wheels/` are built against torch 2.7.1, such an environment is best made as a *second* venv rather than by editing `uv.lock`, following `scripts/deployment/spark/install_deps.sh`:
+
+  ```
+  uv venv --python 3.10 /path/to/venv-cu130
+  uv pip install --python /path/to/venv-cu130/bin/python --index-url https://download.pytorch.org/whl/cu130 "torch==2.10.0" "torchvision==0.25.0"
+  # everything else at the versions of the working venv, then deepspeed==0.17.6 and the repo:
+  uv pip freeze --python .venv/bin/python | grep -v -E '^(torch|torchvision|triton|pytorch-triton|flash[-_]attn|torchcodec|nvidia-|deepspeed|-e )' > /tmp/base.txt
+  uv pip install --python /path/to/venv-cu130/bin/python -r /tmp/base.txt deepspeed==0.17.6
+  uv pip install --python /path/to/venv-cu130/bin/python --no-deps -e .
+  # flash-attn 2.8.3 from source (CUDA_HOME=/usr/local/cuda-13.0; sm_100 SASS runs on sm_103):
+  FLASH_ATTN_CUDA_ARCHS=100 MAX_JOBS=16 uv pip install --python /path/to/venv-cu130/bin/python --no-build-isolation "flash-attn==2.8.3"
+  # torchcodec 0.10.0 from source against the host FFmpeg (needs the libav*-dev headers + pkg-config):
+  I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 ENABLE_CUDA=0 uv pip install --python /path/to/venv-cu130/bin/python --no-build-isolation --no-deps git+https://github.com/pytorch/torchcodec.git@v0.10.0
+  ```
+
+  CUDA 13's NVRTC knows `sm_103`, so `activate_b300.sh` is not needed in that venv. On x86_64 with H100/A100 none of this applies: the default environment compiles fine.
+
 #### DeepSpeed on aarch64 hosts
 
 Multi-GPU training (`--num-gpus > 1`) uses DeepSpeed ZeRO-2 by default, but `pyproject.toml` pins `deepspeed` for x86_64 Linux only (no aarch64 wheels on PyPI), so `uv sync` does not install it on aarch64 and `torchrun … train_b1k.py` fails with `DeepSpeed is not available`. Two options:
@@ -169,6 +186,34 @@ torchrun --nproc_per_node=8 --master_port=29500 scripts/b1k/train_b1k.py \
 Checkpoints land in `$OUTPUT_DIR/b1k-$TASK/checkpoint-<step>/`, each one standalone and directly servable.
 
 **Tune** `OMP_NUM_THREADS` **and** `--dataloader-num-workers` **to your CPU.**
+
+#### Training throughput knobs
+
+What a step costs, measured on 4× B300 at 1024 samples per GPU (global batch 4096) on the `turning_on_radio` demos, and the knobs that changed it. Everything marked *exact* produces bit-identical tensors to the stock code path and is verified by tests (`tests/gr00t/model/test_qwen3_vl_fast_positions.py`, `tests/gr00t/model/test_gr00t_processor.py::TestPixelValuesDtype`).
+
+- **Batched Qwen3-VL position ids** (`Gr00tN1d7Config.fast_vl_position_ids`, default on; *exact*). The stock `transformers` Qwen3-VL code computes M-RoPE position ids and the vision tower's position tables with Python loops over every sample and every image — ~55k `.item()` device syncs and ~6 s of CPU per 1024-sample step, with the GPU idle meanwhile. `gr00t/model/modules/qwen3_vl_fast_positions.py` computes the same tensors with batched ops for any mix of prompt lengths, image counts/sizes, video frames and padding, falling back to the original for layouts it does not recognise. Forward+backward at 1024/GPU: 7.2 s → 3.4 s. Set `"fast_vl_position_ids": false` in the model config to disable.
+- **No full-vocabulary logits** (*exact*). The backbone only reads `hidden_states[-1]`; `Qwen3Backbone` now passes `logits_to_keep=1`, skipping a `(B, 207, 151936)` logits tensor that was computed and discarded every step.
+- `--collate-pixel-values-dtype bfloat16` (default; *exact* under bf16 compute). The collator emits `pixel_values` in bf16 instead of the VLM processor's float32. The vision tower casts them to its bf16 compute dtype anyway (DeepSpeed bf16 or bf16 autocast), so the result is identical while the ~4.8 MB/sample that travels dataloader worker → shared memory → pinned memory → GPU is halved. Recorded in the checkpoint's `processor_config.json` (`pixel_values_dtype`), so serving does the same. Pass `None` for the stock float32 (e.g. pure-fp32 training).
+- `--dataloader-num-workers` / `--dataloader-prefetch-factor` (default 2, PyTorch's). Each worker holds `prefetch_factor` complete per-GPU batches in shared memory (2.4 MB/sample in bf16, 4.8 MB in fp32) on top of its own ~4–10 GB of decode/augmentation buffers, so host RAM is `workers × (buffers + prefetch × batch)` **per rank**. On hosts with a hard memory limit, keep `prefetch_factor 1` and spend the RAM on workers instead. Each worker sustains roughly 20–35 samples/s (HEVC decode ≈ 55 % of its CPU, image augmentation ≈ 25 %) at ~2.5 cores; size workers so that `workers × rate ≥ per-GPU batch / step time`, and check the log: `Wait for shard … in 0.00 seconds` means the data side keeps up. `OMP_NUM_THREADS` only affects the trainer processes (the workers' FFmpeg threads are independent); 4 is plenty.
+- `--compile-blocks vision,llm,dit` (+ `--compile-mode`; **not** bit-identical). Runs `torch.compile` on the repeated transformer blocks (Qwen3-VL vision blocks, the LLM decoder layers, the action head's DiT blocks — `vlsa` for the VL self-attention blocks is also accepted) by wrapping each block's `forward`, so parameters, module names and checkpoints are untouched. It fuses the elementwise work around the GEMMs, which is ~45 % of GPU time in eager mode: forward+backward at 1024/GPU 3.1 s → 1.9 s. Fusion changes where intermediate roundings happen: against an fp32 reference the compiled model is as close as the eager bf16 model (cosine similarity 0.99992 for both), and with identical dropout masks the losses agree to six decimals. Training-only (`TrainingConfig.compile_blocks`; nothing is saved into the model, serving stays eager). Needs an Inductor/Triton that targets your GPU — the default torch 2.7.1 environment cannot compile for B300/B300 (`sm_103`), see [Blackwell GPUs (B300)](#blackwell-gpus-b300). On this hardware `vlsa` hits an Inductor shared-memory config gap (`No valid triton configs … out of resource`), hence its exclusion from the example.
+- `--wandb-project` (default `B1K`), `--use-ddp` (see [DeepSpeed on aarch64 hosts](#deepspeed-on-aarch64-hosts)).
+
+Example: 4× B300 (284 GB each), 130-core CPU budget, 900 GiB host RAM limit — global batch 4096 uses ~205 GB per GPU with DeepSpeed ZeRO-2:
+
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 WANDB_MODE=online OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=4 --master_port=29500 scripts/b1k/train_b1k.py \
+    --experiment-name b1k-$TASK-bs4096 --wandb-project my-project \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path $DATASET_PATH --task-names $TASK \
+    --embodiment-tag NEW_EMBODIMENT --modality-config-path examples/b1k/r1pro.py \
+    --num-gpus 4 --global-batch-size 4096 \
+    --output-dir $OUTPUT_DIR --save-steps 2500 --save-total-limit 3 --max-steps 150000 \
+    --dataloader-num-workers 12 --dataloader-prefetch-factor 1 --decode-only-used-frames \
+    --compile-blocks vision,llm,dit
+```
+
+With the stock code this configuration ran at 7.3 s/step; with the exact changes above 4.3 s/step; the compiled GPU step is ~2 s, so past that point the dataloader (CPU) is the limit — add workers if you have the cores and RAM.
 
 #### Language prompt
 
