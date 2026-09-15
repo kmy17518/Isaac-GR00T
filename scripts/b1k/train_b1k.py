@@ -47,6 +47,21 @@ class B1KFinetuneConfig(FinetuneConfig):
     """Global torch SDPA backend order, e.g. ``cudnn,efficient,flash,math``; torch's default puts
     cuDNN last, on Blackwell it is the fastest for the action head's attention. ``None``: default."""
 
+    compile_blocks: str | None = None
+    """``torch.compile`` the repeated transformer blocks: comma-separated subset of
+    ``vision,llm,dit,vlsa`` (see ``gr00t.model.modules.compile_blocks``). Fuses the elementwise
+    work around the GEMMs; not bit-identical to eager (bf16-noise level). Training-only setting.
+    Requires an Inductor/Triton that supports the GPU (B300: torch >= 2.9 cu130)."""
+
+    compile_mode: str | None = None
+    """``torch.compile`` mode for ``--compile-blocks`` (e.g. ``max-autotune-no-cudagraphs``)."""
+    compile_coordinate_descent: bool = False
+    """Inductor ``coordinate_descent_tuning`` for the compiled blocks: ~3-4 % faster steps on B300
+    for about a minute more compile time per process (cached in ``TORCHINDUCTOR_CACHE_DIR``)."""
+    compile_persistent_reductions: bool | None = None
+    """Inductor ``triton.persistent_reductions``. ``False`` is required to compile the ``vlsa``
+    blocks on Blackwell (their layer-norm backward otherwise needs more shared memory than exists)."""
+
     use_ddp: bool = False
     """Multi-GPU with plain PyTorch DDP instead of the default DeepSpeed ZeRO-2. Use it where
     DeepSpeed is unavailable (e.g. aarch64 hosts: ``pyproject.toml`` only pins it on x86_64).
@@ -171,6 +186,10 @@ if __name__ == "__main__":
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
     config.training.use_ddp = ft_config.use_ddp
+    config.training.compile_blocks = ft_config.compile_blocks
+    config.training.compile_coordinate_descent = ft_config.compile_coordinate_descent
+    config.training.compile_persistent_reductions = ft_config.compile_persistent_reductions
+    config.training.compile_mode = ft_config.compile_mode
     config.training.experiment_name = ft_config.experiment_name
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.save_only_model = ft_config.save_only_model

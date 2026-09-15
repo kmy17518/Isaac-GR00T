@@ -27,6 +27,50 @@ cd $PATH_TO_BEHAVIOR_1K
 ./setup.sh --new-env --omnigibson --bddl --joylo --dataset --eval
 ```
 
+#### Blackwell GPUs (B300)
+
+- **B300, `sm_103`)** — needs a newer NVRTC. Precompiled kernels are fine (`sm_100` SASS runs on `sm_103`), but torch's bundled CUDA 12.8 NVRTC predates `sm_103`, so every kernel PyTorch compiles *at runtime* (the "jiterator" ops, e.g. `torch.prod` on int64 in Qwen3-VL's `rot_pos_emb`) dies on the very first training step — and again in `serve_b1k.py` — with:
+
+  ```
+  nvrtc: error: invalid value for --gpu-architecture (-arch)
+  ```
+
+  Fix: install CUDA 12.9's NVRTC (same `libnvrtc.so.12` soname, ABI-compatible) into the venv once, then put it ahead of torch's copy in **every shell** you train or serve from:
+
+  ```
+  uv pip install --python .venv/bin/python "nvidia-cuda-nvrtc-cu12>=12.9.86,<13"   # once
+
+  source .venv/bin/activate
+  source scripts/activate_b300.sh          # each new shell, after activating the venv
+  ```
+
+  `activate_b300.sh` prepends the wheel's `lib/` dir to `LD_LIBRARY_PATH` (which wins over the RUNPATH torch uses to find `libnvrtc.so.12`), prints `B300 environment configured: NVRTC 12.9.x ...` on success, is idempotent, and warns with the install command if the wheel is missing. If you do not have the script, the equivalent one-liner is:
+
+  ```
+  export LD_LIBRARY_PATH="$(python -c 'import site; print(site.getsitepackages()[0])')/nvidia/cuda_nvrtc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ```
+
+- **`torch.compile` on B300 needs a CUDA 13 build of PyTorch — `scripts/deployment/b300/install_cu130_venv.sh` builds it.** The pinned torch 2.7.1+cu128 ships Triton 3.3.1, whose LLVM has no `sm_103` target (`LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.shfl.sync.bfly.i32`), and `sm_100a` binaries are architecture-locked (`no kernel image is available for execution on the device`), so `--compile-blocks` cannot run in the default environment. It does with `torch==2.10.0+cu130` (Triton 3.6). Because the aarch64 `flash-attn` and `torchcodec` wheels in `scripts/deployment/dgpu/wheels/` are built against torch 2.7.1, the script makes a *second* venv rather than editing `uv.lock` (the default `.venv` keeps working for eager training and serving):
+
+  1. `uv venv` (Python 3.10) + `torch==2.10.0` / `torchvision==0.25.0` from `https://download.pytorch.org/whl/cu130` (~5 min);
+  2. every other dependency at the versions of the default venv (`uv pip freeze` of `.venv`), `deepspeed==0.17.6` (pure-Python build) and the repo as an editable install;
+  3. `torchcodec` 0.10.0 from source against the host FFmpeg (~10 min). CMake gets a toolchain file that pins pybind11's config dir and the Python headers/library, because pybind11 uses the unversioned `FindPython` module and torchcodec the versioned one;
+  4. `flash-attn` 2.8.3 from source with the Spark recipe's CUTLASS pin, `FLASH_ATTN_CUDA_ARCHS=100` (`sm_100` SASS runs on `sm_103`) — 10 min on an idle 130-core box, 1–2 h next to a running training job, at `MAX_JOBS=16` (deliberately throttled so a shared box stays usable);
+  5. `flash-attn-4` (CuTe DSL, pure Python; used by `gr00t_fast` attention for padded batches — see [Training throughput knobs](#training-throughput-knobs)); `INSTALL_FA4=0` skips it;
+  6. smoke tests: flash-attn varlen, torchcodec decode of a generated clip, and a `torch.compile` of a small function on the GPU.
+
+  Prerequisites: the default venv (`uv sync --frozen --python 3.10`), a CUDA 13 toolkit (`CUDA_HOME`, default `/usr/local/cuda-13.0`, driver ≥ 580), CPython 3.10 headers, and FFmpeg development headers with `pkg-config`. Hosts without root and without `python3.10-dev` / `libav*-dev` can unpack those distro packages anywhere and point the script at them — that is how the environment behind this guide was built:
+
+  ```
+  VENV=/path/to/venv-cu130 \
+  PYTHON_INCLUDE_DIR=/path/to/libpython3.10-dev/usr/include/python3.10 \
+  PYTHON_LIBRARY=/path/to/libpython3.10-dev/usr/lib/aarch64-linux-gnu/libpython3.10.so \
+  FFMPEG_DEV_SYSROOT=/path/to/ffmpeg-dev \
+  bash scripts/deployment/b300/install_cu130_venv.sh
+  ```
+
+  The script is re-runnable (each phase leaves a marker in `$WORK`, default `$VENV-build`; delete one to redo that phase) and fixes the dangling `.so` symlinks that unpacked `-dev` packages leave behind. Afterwards `source /path/to/venv-cu130/bin/activate` and train with `--compile-blocks …`; `activate_b300.sh` is not needed there (CUDA 13's NVRTC knows `sm_103`). Everything else in this guide is unchanged; a checkpoint trained in this venv serves fine from the default one. On x86_64 with H100/A100 none of this applies: the default environment compiles fine.
+
 #### DeepSpeed on aarch64 hosts
 
 Multi-GPU training (`--num-gpus > 1`) uses DeepSpeed ZeRO-2 by default, but `pyproject.toml` pins `deepspeed` for x86_64 Linux only (no aarch64 wheels on PyPI), so `uv sync` does not install it on aarch64 and `torchrun … train_b1k.py` fails with `DeepSpeed is not available`. Two options:
@@ -155,10 +199,14 @@ What a step costs, measured on 4× B300 at 1024 samples per GPU (global batch 40
 - **No full-vocabulary logits** (*exact*). The backbone only reads `hidden_states[-1]`; `Qwen3Backbone` now passes `logits_to_keep=1`, skipping a `(B, 207, 151936)` logits tensor that was computed and discarded every step.
 - `--collate-pixel-values-dtype uint8` (default; *exact*). The collator ships the VLM processor's *unnormalized* uint8 patches — a quarter of the float32 bytes (1.2 instead of 4.8 MB/sample) and no float math in the worker — and `Qwen3Backbone` applies the processor's fp32 rescale+normalize (`(x − mean·255) / (std·255)`, the same `sub`/`div_` sequence) on the GPU; the resulting tensors are bit-identical to the processor's. `bfloat16` emits normalized patches in bf16 instead (also identical whenever the vision tower computes in bf16, half the bytes); `None` is the stock float32. Recorded in the checkpoint's `processor_config.json` (`pixel_values_dtype`), so serving does the same.
 - **Numpy episode indexing in `get_shard`** (*exact*). Per-step extraction used ~100k pandas `.iloc` calls per 1024-step shard (~8 % of a worker's CPU); `get_shard` now hands `extract_step_data` an `EpisodeColumns` view of the episode DataFrame (the same row objects). DataFrame callers are unchanged.
+- `--compile-blocks vision,llm,dit` (+ `--compile-mode`; **not** bit-identical). Runs `torch.compile` on the repeated transformer blocks (Qwen3-VL vision blocks, the LLM decoder layers, the action head's DiT blocks — `vlsa` for the VL self-attention blocks is also accepted) by wrapping each block's `forward`, so parameters, module names and checkpoints are untouched. It fuses the elementwise work around the GEMMs, which is ~45 % of GPU time in eager mode: forward+backward at 1024/GPU 3.1 s → 1.9 s. Fusion changes where intermediate roundings happen: against an fp32 reference the compiled model is as close as the eager bf16 model (cosine similarity 0.99992 for both), and with identical dropout masks the losses agree to six decimals. Training-only (`TrainingConfig.compile_blocks`; nothing is saved into the model, serving stays eager). Needs an Inductor/Triton that targets your GPU — the default torch 2.7.1 environment cannot compile for B300/B300 (`sm_103`), see [Blackwell GPUs (B300)](#blackwell-gpus-b300). On this hardware `vlsa` hits an Inductor shared-memory config gap (`No valid triton configs … out of resource`), hence its exclusion from the example.
 - **GPU-side work, measured on the compiled step** (1024 samples/GPU, fwd+bwd 1.97 s before these changes): the frozen backbone's *inference* is ~58 % of it (vision tower 35 %, LLM 16 %), the trainable action head the rest.
   - **Patch embedding as `F.linear`** (`fast_vl_patch_embed`, default on; same math). Qwen3-VL's patch embedding is a `Conv3d` whose kernel is the whole 2×16×16 patch — a linear layer in disguise — and cuDNN has no good kernel for it: 115 ms per step (a generic `sm80` implicit GEMM plus a layout transform) vs 1.3 ms as a GEMM. The linear result is *closer* to an fp32 reference than the convolution's.
   - **No LM head** (*exact*). Only the pre-norm output of the last kept decoder layer is used; `Qwen3Backbone` now captures it with a forward hook while running the base `Qwen3VLModel`, so the 151k-vocabulary GEMM is never issued — even with `logits_to_keep=1` cuBLAS spent ~90 ms per step on that shape.
   - `--backbone-attn-implementation gr00t_fast` (`gr00t/model/modules/fast_attention.py`). HF's `flash_attention_2` runs FlashAttention‑2 kernels that ignore Blackwell's tensor memory and force a `torch.compile` graph break in every block. `gr00t_fast` uses PyTorch SDPA (cuDNN / flash backends) for regular batches — `is_causal` for the decoder, and the packed image segments viewed as a regular `(n_images, heads, 256, d)` batch for the vision tower (HF otherwise loops over the segments) — and FlashAttention **varlen** for padded, multi-task batches: **FlashAttention‑4** (`pip install --prerelease=allow "flash-attn-4[cu13]"`, CuTe DSL, JIT; works on `sm_103`) when installed, else FA2. Numerics: cos 0.99994 to an fp32 reference for both FA2 and `gr00t_fast`; losses agree to 6 decimals on regular and padded batches. Step effect −4.5 %. In isolation FA4 is 1.1–1.4× faster than FA2 on these shapes but slower than cuDNN SDPA for the unpadded ones, which is why it only serves the padded path. `--sdpa-backend-priority cudnn,efficient,flash,math` reorders torch's SDPA backends (default puts cuDNN last); it made no measurable difference at the step level here.
+  - `--compile-coordinate-descent` (Inductor `coordinate_descent_tuning`): −3.5 % step for ~1 min more compile per process (cached afterwards). `--compile-persistent-reductions False` is what lets the `vlsa` blocks compile on Blackwell (their layer-norm backward otherwise becomes a persistent-reduction kernel needing more shared memory than exists) — another −1 %.
+  - **What did not pay off:** CUDA graphs (`--compile-mode reduce-overhead`) — kernel time is ~92 % of the step so the ceiling is small, cudagraph-trees trips over block outputs kept alive across replays (deepstack features), and at 1024/GPU the graph pools do not fit next to the 253 GB the step already uses. FP8 for the frozen backbone (~0.9 s of the step is its inference; Blackwell FP8 GEMMs are ~2× bf16) would be the next lever, but it changes the features the policy is trained on — a decision, not a free optimisation.
+  - Net: fwd+bwd **1.97 → 1.64 s** at 1024/GPU (eval-mode losses identical to 6 decimals; train-mode differences are dropout RNG under Inductor).
 
 #### Checkpoints on the Hub (two monitors)
 
@@ -220,6 +268,7 @@ After finetuning, you can run evaluation by following the steps below:
 1. Deploy finetuned checkpoint:
   ```
     source .venv/bin/activate
+    # source scripts/activate_b300.sh     # B300 only, see "Blackwell GPUs" above
     CUDA_VISIBLE_DEVICES=0 python scripts/b1k/serve_b1k.py \
         --model-path $PATH_TO_CKPT \
         --modality-config-path examples/b1k/r1pro.py \
