@@ -256,9 +256,11 @@ class Gr00tTrainer(Trainer):
             "persistent_workers": persistent_workers,
         }
 
-        # multiprocessing_context can only be used with num_workers > 0
+        # multiprocessing_context / prefetch_factor can only be used with num_workers > 0
         if self.args.dataloader_num_workers > 0:
             dataloader_params["multiprocessing_context"] = self.multiprocessing_context
+            if self.args.dataloader_prefetch_factor is not None:
+                dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
 

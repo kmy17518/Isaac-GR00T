@@ -47,6 +47,11 @@ class B1KFinetuneConfig(FinetuneConfig):
     """Global torch SDPA backend order, e.g. ``cudnn,efficient,flash,math``; torch's default puts
     cuDNN last, on Blackwell it is the fastest for the action head's attention. ``None``: default."""
 
+    dataloader_prefetch_factor: int | None = None
+    """Batches each dataloader worker keeps ready (PyTorch default 2). Each one is a full per-GPU
+    batch in shared memory (~4.8 MB/sample), so 1 halves the dataloader's host-RAM footprint and
+    lets you run more workers under a tight RAM limit."""
+
     compile_blocks: str | None = None
     """``torch.compile`` the repeated transformer blocks: comma-separated subset of
     ``vision,llm,dit,vlsa`` (see ``gr00t.model.modules.compile_blocks``). Fuses the elementwise
@@ -174,6 +179,7 @@ if __name__ == "__main__":
     config.training.optim = "adamw_torch"
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
+    config.training.dataloader_prefetch_factor = ft_config.dataloader_prefetch_factor
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
     config.training.output_dir = ft_config.output_dir

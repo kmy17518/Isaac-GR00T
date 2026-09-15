@@ -119,6 +119,11 @@ class TrainingConfig:
     # Hardware
     num_gpus: int = 1
     dataloader_num_workers: int = 2
+    dataloader_prefetch_factor: int | None = None
+    """Batches each dataloader worker keeps ready ahead of time (PyTorch default 2 when None).
+    Every prefetched batch is a full per-GPU batch in shared memory (~4.8 MB/sample for
+    Qwen3-VL pixel values), so on hosts with a tight RAM limit lower this to 1 rather than
+    reducing the number of workers."""
 
     # Data handling
     remove_unused_columns: bool = False

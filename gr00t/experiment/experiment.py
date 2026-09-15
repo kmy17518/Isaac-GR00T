@@ -274,6 +274,7 @@ def run(config: Config):
         gradient_checkpointing=config.training.gradient_checkpointing,
         optim=config.training.optim,
         dataloader_num_workers=config.training.dataloader_num_workers,
+        dataloader_prefetch_factor=config.training.dataloader_prefetch_factor,
         report_to="wandb" if config.training.use_wandb else "none",
         seed=config.data.seed,
         deepspeed=deepspeed_config,
