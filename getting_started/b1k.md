@@ -134,6 +134,48 @@ Checkpoints land in `$OUTPUT_DIR/b1k-$TASK/checkpoint-<step>/`, each one standal
 
 **Tune** `OMP_NUM_THREADS` **and** `--dataloader-num-workers` **to your CPU.**
 
+#### Checkpoints on the Hub (two monitors)
+
+`--save-steps 2500 --save-total-limit 3` keeps the three newest checkpoints locally (34 GB each: `model-*.safetensors` plus the DeepSpeed ZeRO-2 partitions in `global_step<step>/`, `latest`, `rng_state_*.pth`, `scheduler.pt`, `training_args.bin`). Two scripts under `scripts/b1k/`, run detached next to the training job (tmux), mirror them to one public repo with a folder per experiment:
+
+```
+<user>/<repo>/
+  README.md                               # index of experiments, kept by the eval-only uploader
+  <exp>/
+    README.md                             # per-experiment index and usage
+    checkpoint-10000/ checkpoint-20000/ …  # eval-only copies at the scheduled steps (kept forever)
+    resume/
+      README.md
+      checkpoint-<step>/                  # the ONE latest full checkpoint, replaced every 2500 steps
+```
+
+- **Eval-only copies** — `hf_checkpoint_uploader.py`. At every scheduled step (default: every 10k up to 50k, then every 5k) it waits until `checkpoint-<step>/` is complete and quiet, hard-links the files needed to *serve* the policy into `--staging-dir` (weights, `config.json`, `processor_config.json`, `statistics.json`, `embodiment_id.json`, `experiment_cfg/`, `trainer_state.json`, `wandb_config.json` — no `global_step*/`, rng, scheduler, `training_args.bin`) and uploads that folder to `<exp>/checkpoint-<step>/`. ~7 GB each; they accumulate. It also writes the repo and experiment READMEs and `status.json` (schedule, pending/uploaded steps, last error) in the staging dir. Uploads that fail (e.g. a missing repo permission) are retried with a back-off and never block training.
+
+  ```
+  python scripts/b1k/hf_checkpoint_uploader.py --run-dir $OUTPUT_DIR/$EXP_NAME \
+      --staging-dir $STAGING_DIR/$EXP_NAME --repo-id <user>/<repo> --path-prefix $EXP_NAME \
+      --max-steps 150000 --task turning_on_radio --global-bs 4096 --num-gpus 4 \
+      --experiment-name $EXP_NAME --wandb-project $WANDB_PROJECT
+  ```
+
+- **Latest full checkpoint, one at a time** — `hf_resume_checkpoint_uploader.py`. Whenever a newer checkpoint is complete for *resume* (`trainer_state.json` at that step, `latest` → `global_step<step>`, model state and optimizer shards and RNG states for all ranks, `scheduler.pt`, weights, directory unchanged for 2 min) it uploads the whole directory as-is to `<exp>/resume/checkpoint-<step>/` **and deletes the previous `resume/checkpoint-*` in the same commit**, then verifies every file and size. Deleting on the Hub does not free storage — the old LFS objects stay referenced by history and count against the quota — so it then calls `HfApi.permanently_delete_lfs_files(..., rewrite_history=True)` on the replaced checkpoint's objects, which removes them for good and rewrites the history so nothing points at them. Only objects that no file in the repo still references are deleted: the eval-only copy of the same step shares byte-identical `safetensors` with the full checkpoint and keeps them alive. Net effect: the repo always holds exactly one 35 GB resumable checkpoint (35.7 GB, ~50 s per upload at ~1 GB/s) plus the eval-only copies. `resume-status.json` in `--staging-dir` records the step, commit, bytes freed and the repo's LFS total; the replace-and-collect path was exercised on a scratch repo before going live.
+
+  ```
+  python scripts/b1k/hf_resume_checkpoint_uploader.py --run-dir $OUTPUT_DIR/$EXP_NAME \
+      --staging-dir $STAGING_DIR/$EXP_NAME --repo-id <user>/<repo> --path-prefix $EXP_NAME \
+      --num-gpus 4 --max-steps 150000
+  ```
+
+  Resume elsewhere from the Hub copy:
+
+  ```
+  hf download <user>/<repo> --include "$EXP_NAME/resume/checkpoint-<step>/*" --local-dir ckpt
+  mkdir -p $OUTPUT_DIR/$EXP_NAME && mv ckpt/$EXP_NAME/resume/checkpoint-<step> $OUTPUT_DIR/$EXP_NAME/
+  # then the training command above with --resume-from-checkpoint
+  ```
+
+Both scripts need `HF_TOKEN` in the environment (write access to the repo) and poll every 60 s; they exit on their own once the `--max-steps` checkpoint is on the Hub.
+
 #### Language prompt
 
 The challenge demos carry two kinds of text per task in `meta/tasks.jsonl`. The policy is conditioned on one of them:
