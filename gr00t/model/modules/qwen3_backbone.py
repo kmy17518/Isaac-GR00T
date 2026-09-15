@@ -30,6 +30,59 @@ except ImportError:
     _QWEN3VL_AVAILABLE = False
 
 
+class PixelPatchNormalizer:
+    """Rescale + normalize flattened Qwen-VL image patches on the GPU, bit-identical to the
+    HF fast image processor doing it on the CPU.
+
+    The processor fuses rescale and normalize into ``(x.float() - mean/rescale) / (std/rescale)``
+    (``_fuse_mean_std_and_rescale_factor`` + torchvision ``normalize``: ``sub`` then ``div_`` in
+    fp32) and only afterwards patchifies, a pure view/permute. Those elementwise ops commute with
+    the reordering, so applying them per channel to the flattened ``(C * T * P * P)`` patch layout
+    gives the same fp32 values element for element. The constants are built with the same
+    expressions the processor uses.
+    """
+
+    def __init__(
+        self,
+        image_mean,
+        image_std,
+        rescale_factor: float,
+        patch_size: int,
+        temporal_patch_size: int,
+    ):
+        # Exactly transformers' _fuse_mean_std_and_rescale_factor (fp32 tensor * python float).
+        mean = torch.tensor(image_mean) * (1.0 / rescale_factor)
+        std = torch.tensor(image_std) * (1.0 / rescale_factor)
+        per_channel = temporal_patch_size * patch_size * patch_size
+        # Flattened patch order is (channel, temporal, patch_h, patch_w): channel-major.
+        self.mean = mean.repeat_interleave(per_channel)
+        self.std = std.repeat_interleave(per_channel)
+        self._device_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @classmethod
+    def from_image_processor(cls, image_processor) -> "PixelPatchNormalizer":
+        return cls(
+            image_mean=image_processor.image_mean,
+            image_std=image_processor.image_std,
+            rescale_factor=image_processor.rescale_factor,
+            patch_size=image_processor.patch_size,
+            temporal_patch_size=image_processor.temporal_patch_size,
+        )
+
+    def __call__(self, patches: torch.Tensor) -> torch.Tensor:
+        if patches.shape[-1] != self.mean.numel():
+            raise ValueError(
+                f"pixel_values patch dim {patches.shape[-1]} != {self.mean.numel()} expected by the normalizer"
+            )
+        if patches.device not in self._device_cache:
+            self._device_cache[patches.device] = (
+                self.mean.to(patches.device),
+                self.std.to(patches.device),
+            )
+        mean, std = self._device_cache[patches.device]
+        return patches.to(torch.float32).sub(mean).div_(std)
+
+
 class Qwen3Backbone(torch.nn.Module):
     def __init__(
         self,
@@ -88,6 +141,8 @@ class Qwen3Backbone(torch.nn.Module):
             self.model.language_model.layers.pop(-1)
 
         self.select_layer = select_layer
+        # Set by Gr00tN1d7 from its image processor; used when the collator ships uint8 patches.
+        self.pixel_patch_normalizer: PixelPatchNormalizer | None = None
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
         if load_bf16 and trainable_params_fp32:
             # cast trainable parameters to fp32
@@ -140,6 +195,14 @@ class Qwen3Backbone(torch.nn.Module):
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
+        if vl_input["pixel_values"].dtype == torch.uint8:
+            # Collator emitted unnormalized patches (pixel_values_dtype="uint8"); do the
+            # processor's fp32 rescale+normalize here instead, bit-identically.
+            if self.pixel_patch_normalizer is None:
+                raise RuntimeError(
+                    "uint8 pixel_values need Qwen3Backbone.pixel_patch_normalizer (set by Gr00tN1d7)"
+                )
+            vl_input["pixel_values"] = self.pixel_patch_normalizer(vl_input["pixel_values"])
         outputs = self.model(**vl_input, output_hidden_states=True)
         outputs = outputs.hidden_states[-1]
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id

@@ -149,6 +149,7 @@ Checkpoints land in `$OUTPUT_DIR/b1k-$TASK/checkpoint-<step>/`, each one standal
 
 #### Training throughput knobs
 
+- `--collate-pixel-values-dtype uint8` (default; *exact*). The collator ships the VLM processor's *unnormalized* uint8 patches — a quarter of the float32 bytes (1.2 instead of 4.8 MB/sample) and no float math in the worker — and `Qwen3Backbone` applies the processor's fp32 rescale+normalize (`(x − mean·255) / (std·255)`, the same `sub`/`div_` sequence) on the GPU; the resulting tensors are bit-identical to the processor's. `bfloat16` emits normalized patches in bf16 instead (also identical whenever the vision tower computes in bf16, half the bytes); `None` is the stock float32. Recorded in the checkpoint's `processor_config.json` (`pixel_values_dtype`), so serving does the same.
 - **Numpy episode indexing in `get_shard`** (*exact*). Per-step extraction used ~100k pandas `.iloc` calls per 1024-step shard (~8 % of a worker's CPU); `get_shard` now hands `extract_step_data` an `EpisodeColumns` view of the episode DataFrame (the same row objects). DataFrame callers are unchanged.
 
 #### Checkpoints on the Hub (two monitors)

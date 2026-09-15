@@ -93,13 +93,38 @@ class Gr00tN1d7DataCollator:
         model_name: str,
         model_type: str = "qwen",
         transformers_loading_kwargs: dict = {},
+        pixel_values_dtype: str | None = None,
     ):
+        """
+        Args:
+            pixel_values_dtype: how ``pixel_values`` leave the collator instead of as the VLM
+                processor's normalized float32 patches (~4.8 MB per sample for Qwen3-VL):
+
+                * a float dtype name such as ``"bfloat16"``: the normalized patches cast to
+                  that dtype. The vision tower casts pixel values to its own compute dtype
+                  anyway, so with a bf16 model or bf16 autocast the result is bit-identical
+                  and half the bytes cross dataloader workers -> shared memory -> pinned
+                  memory -> GPU;
+                * ``"uint8"``: the *unnormalized* uint8 patches (a quarter of the bytes, and
+                  no float math in the worker). The VLM processor is asked to skip rescale
+                  and normalize, which are the only value-changing steps after resizing;
+                  ``Qwen3Backbone`` then applies the identical fp32 ``(x - mean*255) /
+                  (std*255)`` on the GPU, so the model sees bit-identical tensors;
+                * ``None``: unchanged float32.
+        """
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
         # Set padding side to 'left' for Flash Attention compatibility
         self.processor.tokenizer.padding_side = "left"
         self.model_type = model_type
         self.model_name = model_name
+        self.pixel_values_dtype = pixel_values_dtype
+        self._emit_uint8_patches = pixel_values_dtype == "uint8"
+        self._pixel_values_torch_dtype = (
+            getattr(torch, pixel_values_dtype)
+            if pixel_values_dtype and not self._emit_uint8_patches
+            else None
+        )
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
@@ -118,13 +143,25 @@ class Gr00tN1d7DataCollator:
                     curr_image_inputs = v["images"]
                     image_inputs += curr_image_inputs
 
+                image_kwargs = (
+                    # Unnormalized uint8 patches; the backbone normalizes on the GPU.
+                    {"do_rescale": False, "do_normalize": False} if self._emit_uint8_patches else {}
+                )
                 vlm_inputs = self.processor(
                     text=text_list,
                     images=image_inputs,
                     return_tensors="pt",
                     padding=True,
+                    **image_kwargs,
                 )
                 for k, v in vlm_inputs.items():
+                    if k == "pixel_values":
+                        if self._emit_uint8_patches and v.dtype != torch.uint8:
+                            raise RuntimeError(
+                                f"expected uint8 pixel_values from the VLM processor, got {v.dtype}"
+                            )
+                        if self._pixel_values_torch_dtype is not None:
+                            v = v.to(self._pixel_values_torch_dtype)
                     batch[k] = v
             elif key in (
                 "pixel_values",
@@ -139,7 +176,10 @@ class Gr00tN1d7DataCollator:
         return BatchFeature(data={"inputs": batch})
 
     def __str__(self):
-        return f"Gr00tN1d7DataCollator(model_name={self.model_name}, model_type={self.model_type})"
+        return (
+            f"Gr00tN1d7DataCollator(model_name={self.model_name}, model_type={self.model_type}, "
+            f"pixel_values_dtype={self.pixel_values_dtype})"
+        )
 
 
 class Gr00tN1d7Processor(BaseProcessor):
@@ -176,8 +216,12 @@ class Gr00tN1d7Processor(BaseProcessor):
         use_mean_std: bool = False,
         # Backward-compat params (stored but not actively used)
         letter_box_transform: bool = False,
+        # dtype the collator emits pixel_values in (None = VLM processor's float32); see
+        # Gr00tN1d7DataCollator.
+        pixel_values_dtype: str | None = None,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
+        self.pixel_values_dtype = pixel_values_dtype
 
         # Initialize StateActionProcessor for state/action normalization
         self.state_action_processor = StateActionProcessor(
@@ -256,6 +300,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_name=model_name,
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            pixel_values_dtype=pixel_values_dtype,
         )
         self.train()
 
@@ -707,6 +752,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "model_name": self.model_name,
                 "model_type": self.model_type,
                 "formalize_language": self.formalize_language,
+                "pixel_values_dtype": self.pixel_values_dtype,
                 # State action dimensions
                 "max_state_dim": self.max_state_dim,
                 "max_action_dim": self.max_action_dim,
@@ -790,6 +836,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
+        processor_kwargs.setdefault("pixel_values_dtype", None)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -809,6 +856,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "pixel_values_dtype",
             ]
             for key in override_keys:
                 if key in kwargs:

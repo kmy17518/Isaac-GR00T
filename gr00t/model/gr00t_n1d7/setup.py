@@ -75,6 +75,17 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         self.train_dataset, self.eval_dataset = self._create_dataset(self.save_cfg_dir)
         self.data_collator = self._create_collator()
 
+    def _runtime_model_kwargs(self) -> dict:
+        """Gr00tN1d7Config fields that are runtime knobs (not part of a checkpoint) and must
+        therefore be passed explicitly when the model is loaded from one."""
+        return {
+            name: getattr(self.config.model, name)
+            for name in (
+                "collate_pixel_values_dtype",
+            )
+            if hasattr(self.config.model, name)
+        }
+
     def _create_model(self):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
@@ -91,6 +102,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
+                **self._runtime_model_kwargs(),
                 **self.transformers_loading_kwargs,
             )
 
@@ -177,6 +189,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                pixel_values_dtype=self.model_config.collate_pixel_values_dtype,
                 **self.transformers_loading_kwargs,
             )
         else:
@@ -205,6 +218,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                pixel_values_dtype=self.model_config.collate_pixel_values_dtype,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 

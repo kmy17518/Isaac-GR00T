@@ -32,6 +32,13 @@ class B1KFinetuneConfig(FinetuneConfig):
     """W&B project the run is logged to (``--wandb-project``); the run name is
     ``--experiment-name``. Defaults to the B1K project this script has always used."""
 
+    collate_pixel_values_dtype: str | None = "uint8"
+    """How the data collator emits ``pixel_values``. ``uint8`` (default): the unnormalized uint8
+    patches, a quarter of the processor's float32 bytes and no float math in the worker; the
+    backbone applies the processor's fp32 rescale+normalize on the GPU, bit-identically.
+    ``bfloat16``: normalized patches cast to bf16 (also bit-identical under bf16 compute, half
+    the bytes). ``None``: the processor's float32. Saved in the checkpoint's processor config."""
+
     use_ddp: bool = False
     """Multi-GPU with plain PyTorch DDP instead of the default DeepSpeed ZeRO-2. Use it where
     DeepSpeed is unavailable (e.g. aarch64 hosts: ``pyproject.toml`` only pins it on x86_64).
@@ -133,6 +140,7 @@ if __name__ == "__main__":
     config.model.color_jitter_params = ft_config.color_jitter_params
 
     config.model.load_bf16 = False
+    config.model.collate_pixel_values_dtype = ft_config.collate_pixel_values_dtype
     config.model.reproject_vision = False
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True

@@ -548,7 +548,17 @@ class Gr00tN1d7(PreTrainedModel):
             model_name=config.model_name,
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            pixel_values_dtype=getattr(config, "collate_pixel_values_dtype", None),
         )
+        # GPU-side rescale+normalize for uint8 pixel_values (pixel_values_dtype="uint8"), built from
+        # the same VLM image processor the collators use so the constants match.
+        image_processor = getattr(self.collator.processor, "image_processor", None)
+        if image_processor is not None and hasattr(self.backbone, "pixel_patch_normalizer"):
+            from gr00t.model.modules.qwen3_backbone import PixelPatchNormalizer
+
+            self.backbone.pixel_patch_normalizer = PixelPatchNormalizer.from_image_processor(
+                image_processor
+            )
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:
         """Prepare inputs for backbone and action head."""

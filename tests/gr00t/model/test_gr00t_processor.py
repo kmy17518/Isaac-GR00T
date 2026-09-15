@@ -269,3 +269,131 @@ class TestFixtureCompleteness:
             f"Fixture has fields that save_pretrained() no longer writes: {extra}. "
             f"Remove them from tests/fixtures/processor_config/processor_config.json."
         )
+
+
+class TestPixelValuesDtype:
+    """The collator can emit pixel_values in a reduced dtype; the setting round-trips through
+    save_pretrained / from_pretrained and reaches the collator."""
+
+    def _collator(self, dtype_name):
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator
+        import torch
+
+        mock_vlm = MagicMock()
+        mock_vlm.tokenizer.padding_side = "left"
+        pixel_values = torch.randn(6, 1536, dtype=torch.float32)
+        mock_vlm.return_value = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 2]]),
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "attention_mask": torch.tensor([[1, 1, 1]]),
+        }
+        with patch(
+            "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+            return_value=mock_vlm,
+        ):
+            collator = Gr00tN1d7DataCollator("mock", pixel_values_dtype=dtype_name)
+        return collator, pixel_values
+
+    def test_collator_casts_pixel_values_only(self):
+        import torch
+
+        collator, pixel_values = self._collator("bfloat16")
+        batch = collator([{"vlm_content": {"text": "t", "images": []}}])["inputs"]
+        assert batch["pixel_values"].dtype == torch.bfloat16
+        assert torch.equal(batch["pixel_values"], pixel_values.to(torch.bfloat16))
+        assert batch["input_ids"].dtype == torch.int64
+        assert batch["image_grid_thw"].dtype == torch.int64
+
+    def test_collator_default_leaves_dtype(self):
+        import torch
+
+        collator, pixel_values = self._collator(None)
+        batch = collator([{"vlm_content": {"text": "t", "images": []}}])["inputs"]
+        assert batch["pixel_values"].dtype == torch.float32
+        assert torch.equal(batch["pixel_values"], pixel_values)
+
+    def test_processor_roundtrip_reaches_collator(self, processor):
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+        assert processor.pixel_values_dtype is None  # fixture default
+        mock_vlm = MagicMock()
+        mock_vlm.tokenizer.padding_side = "left"
+        with patch(
+            "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+            return_value=mock_vlm,
+        ):
+            proc = Gr00tN1d7Processor.from_pretrained(FIXTURE_DIR, pixel_values_dtype="bfloat16")
+            assert proc.pixel_values_dtype == "bfloat16"
+            assert proc.collator.pixel_values_dtype == "bfloat16"
+            with tempfile.TemporaryDirectory() as tmp:
+                proc.save_pretrained(tmp)
+                with open(Path(tmp) / "processor_config.json") as f:
+                    assert json.load(f)["processor_kwargs"]["pixel_values_dtype"] == "bfloat16"
+                reloaded = Gr00tN1d7Processor.from_pretrained(tmp)
+            assert reloaded.pixel_values_dtype == "bfloat16"
+            assert reloaded.collator.pixel_values_dtype == "bfloat16"
+
+
+class TestUint8PixelValues:
+    """pixel_values_dtype="uint8": the collator ships unnormalized uint8 patches and
+    PixelPatchNormalizer reproduces the processor's fp32 rescale+normalize bit for bit."""
+
+    def test_normalizer_matches_torchvision_formula(self):
+        from gr00t.model.modules.qwen3_backbone import PixelPatchNormalizer
+        import torch
+        from torchvision.transforms.v2 import functional as F
+
+        mean, std, rescale = (
+            [0.48145466, 0.4578275, 0.40821073],
+            [0.26862954, 0.26130258, 0.27577711],
+            1 / 255,
+        )
+        P, T, C, H, W = 4, 2, 3, 8, 8
+        img = torch.randint(0, 256, (1, C, H, W), dtype=torch.uint8)
+        # transformers' fused path: (x.float() - mean/rescale) / (std/rescale), then patchify
+        fused_mean = torch.tensor(mean) * (1.0 / rescale)
+        fused_std = torch.tensor(std) * (1.0 / rescale)
+        ref = F.normalize(img.to(torch.float32), fused_mean.tolist(), fused_std.tolist())
+        ref = ref.unsqueeze(1)
+        ref = torch.cat([ref, ref[:, -1:].repeat(1, T - 1, 1, 1, 1)], dim=1)  # temporal repeat
+        ref = ref.view(1, 1, T, C, H // P // 2, 2, P, W // P // 2, 2, P).permute(
+            0, 1, 4, 7, 5, 8, 3, 2, 6, 9
+        )
+        ref = ref.reshape(-1, C * T * P * P)
+        # same patchify on the raw uint8, then the normalizer
+        raw = img.unsqueeze(1)
+        raw = torch.cat([raw, raw[:, -1:].repeat(1, T - 1, 1, 1, 1)], dim=1)
+        raw = raw.view(1, 1, T, C, H // P // 2, 2, P, W // P // 2, 2, P).permute(
+            0, 1, 4, 7, 5, 8, 3, 2, 6, 9
+        )
+        raw = raw.reshape(-1, C * T * P * P)
+        out = PixelPatchNormalizer(mean, std, rescale, P, T)(raw)
+        assert out.dtype == torch.float32 and torch.equal(out, ref)
+
+    def test_collator_uint8_matches_processor_float32(self):
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator
+        from gr00t.model.modules.qwen3_backbone import PixelPatchNormalizer
+        import numpy as np
+        import torch
+
+        try:
+            c32 = Gr00tN1d7DataCollator("nvidia/Cosmos-Reason2-2B")
+        except Exception as e:  # noqa: BLE001 - needs the cached VLM processor
+            pytest.skip(f"VLM processor not available locally: {e}")
+        c16 = Gr00tN1d7DataCollator("nvidia/Cosmos-Reason2-2B", pixel_values_dtype="bfloat16")
+        cu8 = Gr00tN1d7DataCollator("nvidia/Cosmos-Reason2-2B", pixel_values_dtype="uint8")
+        rng = np.random.default_rng(0)
+        images = [rng.integers(0, 256, (256, 256, 3), dtype=np.uint8) for _ in range(3)]
+        feats = [{"vlm_content": {"text": "turning on radio", "images": images}}]
+        b32, b16, bu8 = (c([dict(f) for f in feats])["inputs"] for c in (c32, c16, cu8))
+        assert (
+            b32["pixel_values"].dtype == torch.float32 and bu8["pixel_values"].dtype == torch.uint8
+        )
+        assert torch.equal(b32["input_ids"], bu8["input_ids"]) and torch.equal(
+            b32["image_grid_thw"], bu8["image_grid_thw"]
+        )
+        norm = PixelPatchNormalizer.from_image_processor(cu8.processor.image_processor)
+        restored = norm(bu8["pixel_values"])
+        assert torch.equal(restored, b32["pixel_values"])  # exact fp32
+        assert torch.equal(restored.to(torch.bfloat16), b16["pixel_values"])  # exact bf16 path too

@@ -49,6 +49,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_flash_attention: bool = True
     load_bf16: bool = False  # Enable BF16 loading
     backbone_trainable_params_fp32: bool = True
+    # How the data collator emits `pixel_values` (None = the VLM processor's float32). "bfloat16":
+    # normalized patches in bf16 (half the host/shm/H2D traffic; bit-identical whenever the vision
+    # tower computes in bf16). "uint8": unnormalized uint8 patches (a quarter of the bytes), with the
+    # processor's fp32 rescale+normalize applied on the GPU by Qwen3Backbone, bit-identically.
+    # Recorded in the checkpoint's processor config so training and serving agree.
+    collate_pixel_values_dtype: str | None = None
 
     ### Processing parameters
     image_crop_size: tuple[int, int] | None = (230, 230)
