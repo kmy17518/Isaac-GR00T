@@ -147,6 +147,10 @@ Checkpoints land in `$OUTPUT_DIR/b1k-$TASK/checkpoint-<step>/`, each one standal
 
 **Tune** `OMP_NUM_THREADS` **and** `--dataloader-num-workers` **to your CPU.**
 
+#### Training throughput knobs
+
+- **Numpy episode indexing in `get_shard`** (*exact*). Per-step extraction used ~100k pandas `.iloc` calls per 1024-step shard (~8 % of a worker's CPU); `get_shard` now hands `extract_step_data` an `EpisodeColumns` view of the episode DataFrame (the same row objects). DataFrame callers are unchanged.
+
 #### Checkpoints on the Hub (two monitors)
 
 `--save-steps 2500 --save-total-limit 3` keeps the three newest checkpoints locally (34 GB each: `model-*.safetensors` plus the DeepSpeed ZeRO-2 partitions in `global_step<step>/`, `latest`, `rng_state_*.pth`, `scheduler.pt`, `training_args.bin`). Two scripts under `scripts/b1k/`, run detached next to the training job (tmux), mirror them to one public repo with a folder per experiment:

@@ -25,14 +25,45 @@ from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStep
 from .lerobot_episode_loader import LeRobotEpisodeLoader
 
 
+class EpisodeColumns:
+    """Column-array view of an episode DataFrame for repeated per-step extraction.
+
+    ``extract_step_data`` is called once per timestep of a shard; indexing a DataFrame with
+    ``Series.iloc`` there costs ~100k pandas calls per 1024-step shard (~8 % of a dataloader
+    worker's CPU). This holds ``Series.to_numpy()`` of every column -- the same row objects, no
+    copies -- so a step is plain numpy fancy indexing. Values are identical to the DataFrame path.
+    """
+
+    __slots__ = ("arrays", "columns", "num_rows")
+
+    def __init__(self, arrays: dict[str, np.ndarray], num_rows: int):
+        self.arrays = arrays
+        self.columns = arrays.keys()
+        self.num_rows = num_rows
+
+    @classmethod
+    def from_dataframe(cls, episode_data: pd.DataFrame) -> "EpisodeColumns":
+        return cls(
+            {column: episode_data[column].to_numpy() for column in episode_data.columns},
+            len(episode_data),
+        )
+
+    def __len__(self) -> int:
+        return self.num_rows
+
+    def take(self, column: str, indices: list[int]) -> np.ndarray:
+        return self.arrays[column][indices]
+
+
 def extract_step_data(
-    episode_data: pd.DataFrame,
+    episode_data: pd.DataFrame | EpisodeColumns,
     step_index: int,
     modality_configs: dict[str, ModalityConfig],
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
 ) -> VLAStepData:
     step_data = {}
+    is_dataframe = isinstance(episode_data, pd.DataFrame)
 
     # Extract data for each configured modality
     for modality, config in modality_configs.items():
@@ -42,17 +73,22 @@ def extract_step_data(
         if allow_padding:
             indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
         for key in config.modality_keys:
-            if f"{modality}.{key}" in episode_data.columns:
-                modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
-            else:
+            column = f"{modality}.{key}"
+            if column not in episode_data.columns:
                 raise KeyError(
-                    f"{modality}.{key} not found in episode data, available keys: {episode_data.columns}"
+                    f"{column} not found in episode data, available keys: {episode_data.columns}"
                 )
+            # Rows of the column at the requested timesteps, as an object array of the stored
+            # per-row values (identical objects on both paths).
+            if is_dataframe:
+                modality_data = episode_data[column].iloc[indices_to_load].to_numpy()
+            else:
+                modality_data = episode_data.take(column, indices_to_load)
             if modality in ["state", "action"]:
                 # Stack arrays for numerical modalities
                 step_data[modality][key] = np.vstack(
                     [
-                        np.array(modality_data.iloc[i]).astype(np.float32)
+                        np.array(modality_data[i]).astype(np.float32)
                         for i in range(len(modality_data))
                     ]
                 )
@@ -259,7 +295,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         """Return the number of shards in the dataset."""
         return len(self.shard_lengths)
 
-    def get_datapoint(self, episode_data: pd.DataFrame, step_index: int) -> dict:
+    def get_datapoint(self, episode_data: pd.DataFrame | EpisodeColumns, step_index: int) -> dict:
         """
         Extract and process a single timestep from episode data.
 
@@ -267,7 +303,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         the configured processor to create model-ready inputs.
 
         Args:
-            episode_data: Complete episode DataFrame from LeRobotEpisodeLoader
+            episode_data: Complete episode DataFrame from LeRobotEpisodeLoader, or its
+                ``EpisodeColumns`` view (what ``get_shard`` passes; same values, cheaper per step)
             step_index: Timestep index within the episode to extract
 
         Returns:
@@ -324,8 +361,10 @@ class ShardedSingleStepDataset(ShardedDataset):
             else:
                 # Load episode data once per episode in shard (decodes all frames)
                 episode_data = self.episode_loader[ep_idx]
+            # One column-array view per episode instead of pandas indexing per step.
+            columns = EpisodeColumns.from_dataframe(episode_data)
             for step_index in step_indices:
-                datapoints.append(self.get_datapoint(episode_data, step_index))
+                datapoints.append(self.get_datapoint(columns, step_index))
         return datapoints
 
     def get_dataset_statistics(self) -> dict:

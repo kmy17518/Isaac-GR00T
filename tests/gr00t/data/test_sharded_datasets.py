@@ -571,3 +571,93 @@ class TestShardedSingleStepDataset:
         assert all(length > 0 for length in dataset.shard_lengths), (
             "All shards must have length > 0"
         )
+
+
+class TestExtractStepDataColumns:
+    """``extract_step_data`` must return identical data whether it indexes the episode DataFrame or
+    the ``EpisodeColumns`` view that ``get_shard`` now hands it (same row objects, no pandas per step)."""
+
+    @staticmethod
+    def _episode(n=12, seed=0):
+        import pandas as pd
+
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame(
+            {
+                "video.head": [rng.integers(0, 255, (4, 4, 3), dtype=np.uint8) for _ in range(n)],
+                "video.wrist": [rng.integers(0, 255, (4, 4, 3), dtype=np.uint8) for _ in range(n)],
+                "state.arm": [rng.standard_normal(7).astype(np.float64) for _ in range(n)],
+                "state.gripper": [rng.standard_normal(2).astype(np.float32) for _ in range(n)],
+                "action.arm": [rng.standard_normal(7).astype(np.float64) for _ in range(n)],
+                "language.annotation.human.task_name": ["turning_on_radio"] * n,
+                "unused.column": np.arange(n, dtype=np.float32),  # numeric column, must be ignored
+            }
+        )
+
+    @staticmethod
+    def _configs():
+        from gr00t.data.types import ModalityConfig
+
+        return {
+            "video": ModalityConfig(delta_indices=[0], modality_keys=["head", "wrist"]),
+            "state": ModalityConfig(delta_indices=[0], modality_keys=["arm", "gripper"]),
+            "action": ModalityConfig(delta_indices=list(range(4)), modality_keys=["arm"]),
+            "language": ModalityConfig(
+                delta_indices=[0], modality_keys=["annotation.human.task_name"]
+            ),
+        }
+
+    @pytest.mark.parametrize("allow_padding", [False, True])
+    def test_dataframe_and_columns_paths_identical(self, allow_padding):
+        from gr00t.data.dataset.sharded_single_step_dataset import EpisodeColumns, extract_step_data
+        from gr00t.data.embodiment_tags import EmbodimentTag
+
+        df = self._episode()
+        cols = EpisodeColumns.from_dataframe(df)
+        assert len(cols) == len(df) and set(cols.columns) == set(df.columns)
+        steps = range(0, len(df) - 3) if not allow_padding else range(len(df))
+        for step in steps:
+            a = extract_step_data(
+                df, step, self._configs(), EmbodimentTag.NEW_EMBODIMENT, allow_padding
+            )
+            b = extract_step_data(
+                cols, step, self._configs(), EmbodimentTag.NEW_EMBODIMENT, allow_padding
+            )
+            for key in a.states:
+                assert a.states[key].dtype == b.states[key].dtype == np.float32
+                assert a.states[key].shape == b.states[key].shape == (1, len(df["state." + key][0]))
+                assert np.array_equal(a.states[key], b.states[key])
+            for key in a.actions:
+                assert a.actions[key].shape == b.actions[key].shape == (4, 7)
+                assert np.array_equal(a.actions[key], b.actions[key])
+            for key in a.images:
+                assert len(a.images[key]) == len(b.images[key]) == 1
+                assert a.images[key][0] is b.images[key][0]  # same stored frame object, no copy
+            assert a.text == b.text == "turning_on_radio"
+            assert a.embodiment == b.embodiment
+
+    def test_state_values_match_source_rows(self):
+        from gr00t.data.dataset.sharded_single_step_dataset import EpisodeColumns, extract_step_data
+        from gr00t.data.embodiment_tags import EmbodimentTag
+
+        df = self._episode()
+        out = extract_step_data(
+            EpisodeColumns.from_dataframe(df), 5, self._configs(), EmbodimentTag.NEW_EMBODIMENT
+        )
+        assert np.array_equal(out.states["arm"][0], df["state.arm"][5].astype(np.float32))
+        assert np.array_equal(
+            out.actions["arm"],
+            np.vstack([df["action.arm"][5 + i] for i in range(4)]).astype(np.float32),
+        )
+
+    def test_missing_key_raises(self):
+        from gr00t.data.dataset.sharded_single_step_dataset import EpisodeColumns, extract_step_data
+        from gr00t.data.embodiment_tags import EmbodimentTag
+        from gr00t.data.types import ModalityConfig
+
+        cfg = self._configs()
+        cfg["state"] = ModalityConfig(delta_indices=[0], modality_keys=["missing"])
+        with pytest.raises(KeyError):
+            extract_step_data(
+                EpisodeColumns.from_dataframe(self._episode()), 0, cfg, EmbodimentTag.NEW_EMBODIMENT
+            )

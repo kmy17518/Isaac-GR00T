@@ -55,8 +55,8 @@ from gr00t.data.dataset.lerobot_episode_loader import (
     subset_data_files,
     task_subset_stats_dir,
 )
-from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
-from gr00t.data.state_action.pose import EndEffectorPose, JointPose
+from gr00t.data.state_action.action_chunking import EndEffectorActionChunk
+from gr00t.data.state_action.pose import EndEffectorPose
 from gr00t.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
 from gr00t.data.utils import to_json_serializable
 
@@ -404,6 +404,17 @@ class RelativeActionLoader:
         )
 
     def load_relative_actions(self, trajectory_id: int) -> list[np.ndarray]:
+        """Relative action chunks of one episode, one ``(horizon, dim)`` array per step."""
+        return list(self.load_relative_actions_array(trajectory_id))
+
+    def load_relative_actions_array(self, trajectory_id: int) -> np.ndarray:
+        """Relative action chunks for one episode as a ``(usable, horizon, dim)`` float32 array.
+
+        NON_EEF chunking is a plain joint-space subtraction and is vectorized here
+        (float64 subtract, then float32 cast -- bit-identical to the per-step
+        ``JointPose`` path, which stores float64 joints and casts the result to
+        float32). EEF chunking keeps the original per-step code.
+        """
         df = self.loader[trajectory_id]
 
         # OPTIMIZATION: Extract columns once and convert to numpy arrays
@@ -417,30 +428,43 @@ class RelativeActionLoader:
         # Convert to numpy arrays once - this is much faster than repeated pandas access
         state_data = df[state_key].values  # Shape: (episode_length, joint_dim)
         action_data = df[action_key].values  # Shape: (episode_length, joint_dim)
-        trajectories = []
         usable_length = len(df) - self.modality_configs["action"].delta_indices[-1]
         action_delta_indices = np.array(self.modality_configs["action"].delta_indices)
+        state_last_delta = self.modality_configs["state"].delta_indices[-1]
+
+        if self.action_config.type == ActionType.NON_EEF:
+            actions = np.stack(action_data).astype(np.float64)  # (episode_length, dim)
+            states = np.stack(state_data).astype(np.float64)
+            horizon, dim = len(action_delta_indices), actions.shape[1]
+            if usable_length <= 0:
+                return np.empty((0, horizon, dim), dtype=np.float32)
+            window = np.arange(usable_length)[:, None] + action_delta_indices[None, :]
+            chunks = actions[window]  # (usable, horizon, dim)
+            references = states[state_last_delta : state_last_delta + usable_length]
+            return (chunks - references[:, None, :]).astype(np.float32)
+
+        if self.action_config.type != ActionType.EEF:
+            raise ValueError(f"Unknown ActionType: {self.action_config.type}")
+
+        trajectories = []
         for i in range(usable_length):
-            state_ind = self.modality_configs["state"].delta_indices[-1] + i
+            state_ind = state_last_delta + i
             action_inds = action_delta_indices + i
             last_state = state_data[state_ind]
             actions = action_data[action_inds]
-            if self.action_config.type == ActionType.EEF:
-                action_format = self.action_config.format
-                reference_frame = EndEffectorPose.from_action_format(last_state, action_format)
-                traj = EndEffectorActionChunk.from_array(actions, action_format).relative_chunking(
-                    reference_frame=reference_frame
-                )
-                trajectories.append(traj.to(action_format).astype(np.float32))
-            elif self.action_config.type == ActionType.NON_EEF:
-                reference_frame = JointPose(last_state)
-                traj = JointActionChunk([JointPose(m) for m in actions]).relative_chunking(
-                    reference_frame=reference_frame
-                )
-                trajectories.append(np.stack([p.joints for p in traj.poses], dtype=np.float32))
-            else:
-                raise ValueError(f"Unknown ActionType: {self.action_config.type}")
-        return trajectories
+            action_format = self.action_config.format
+            reference_frame = EndEffectorPose.from_action_format(last_state, action_format)
+            traj = EndEffectorActionChunk.from_array(actions, action_format).relative_chunking(
+                reference_frame=reference_frame
+            )
+            trajectories.append(traj.to(action_format).astype(np.float32))
+        return np.stack(trajectories) if trajectories else np.empty((0, 0, 0), dtype=np.float32)
+
+    def usable_lengths(self) -> np.ndarray:
+        """Per-episode count of relative-action chunks, in episode order."""
+        last_delta = self.modality_configs["action"].delta_indices[-1]
+        lengths = np.asarray(self.loader.episode_lengths, dtype=np.int64)
+        return np.maximum(0, lengths - last_delta)
 
     def __len__(self) -> int:
         return len(self.loader)
@@ -453,12 +477,30 @@ def calculate_stats_for_key(
     max_episodes: int = -1,
     task_names: str | Iterable[str] | None = None,
 ) -> dict:
+    """Relative-action statistics for one action group.
+
+    Args:
+        max_episodes: If >= 0, use only the first ``max_episodes`` episodes (legacy).
+        task_names: Optional task subset (see ``LeRobotEpisodeLoader``).
+    """
     loader = RelativeActionLoader(dataset_path, embodiment_tag, group_key, task_names=task_names)
-    trajectories = []
-    for episode_id in tqdm(range(len(loader)), desc=f"Loading trajectories for key {group_key}"):
-        if max_episodes != -1 and episode_id >= max_episodes:
-            break
-        trajectories.extend(loader.load_relative_actions(episode_id))
+    num_episodes = len(loader) if max_episodes == -1 else min(len(loader), max_episodes)
+    # One (usable, horizon, dim) block per episode, concatenated once: no per-step
+    # Python objects, same numbers as the former per-chunk list.
+    blocks = [
+        loader.load_relative_actions_array(episode_id)
+        for episode_id in tqdm(
+            range(num_episodes), desc=f"Loading trajectories for key {group_key}"
+        )
+    ]
+    blocks = [block for block in blocks if block.size > 0]
+    if not blocks:
+        raise ValueError(
+            f"No relative action chunks for key {group_key!r} in {dataset_path}: every episode "
+            f"is shorter than the action horizon"
+        )
+    trajectories = np.concatenate(blocks, axis=0)
+    del blocks
     return {
         "max": np.max(trajectories, axis=0),
         "min": np.min(trajectories, axis=0),
