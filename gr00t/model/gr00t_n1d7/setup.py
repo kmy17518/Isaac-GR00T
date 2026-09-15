@@ -81,6 +81,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         return {
             name: getattr(self.config.model, name)
             for name in (
+                "fast_vl_position_ids",
                 "collate_pixel_values_dtype",
             )
             if hasattr(self.config.model, name)

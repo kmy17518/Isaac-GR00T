@@ -49,6 +49,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_flash_attention: bool = True
     load_bf16: bool = False  # Enable BF16 loading
     backbone_trainable_params_fp32: bool = True
+    # Batched (bitwise-identical) Qwen3-VL position-id / vision position computations instead of
+    # the stock per-sample / per-image Python loops, which make large batches CPU-bound.
+    fast_vl_position_ids: bool = True
     # How the data collator emits `pixel_values` (None = the VLM processor's float32). "bfloat16":
     # normalized patches in bf16 (half the host/shm/H2D traffic; bit-identical whenever the vision
     # tower computes in bf16). "uint8": unnormalized uint8 patches (a quarter of the bytes), with the
