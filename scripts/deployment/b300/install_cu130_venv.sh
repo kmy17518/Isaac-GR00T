@@ -32,7 +32,8 @@
 #   MAX_JOBS=16 NVCC_THREADS=2    parallelism of the source builds (16 keeps a shared box usable)
 #   TORCH_VER=2.10.0 TORCHVISION_VER=0.25.0 TORCHCODEC_VER=0.10.0 FA_TAG=v2.8.3 CUTLASS_SHA=<sha>
 #
-# Runtime: torch + deps ~5 min, torchcodec ~10 min, flash-attn 1-2 h at MAX_JOBS=16. Re-runnable: each
+# Runtime: torch + deps ~1-5 min, torchcodec ~1-10 min, flash-attn 10 min (idle 130-core host) to 1-2 h (next
+# to a running training job) at MAX_JOBS=16; ~11 min total measured on an idle host. Re-runnable: each
 # phase is skipped once its marker exists in $WORK; delete a marker to redo a phase.
 #
 # Use afterwards:  source $VENV/bin/activate   (no activate_b300.sh needed: CUDA 13's NVRTC knows sm_103)
@@ -189,7 +190,7 @@ if [ ! -f "$WORK/.flash-attn-done" ]; then
     SITE=$("$VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')
     export LD_LIBRARY_PATH="$SITE/torch/lib:$(find "$SITE/nvidia" -name lib -type d | tr '\n' ':')${LD_LIBRARY_PATH:-}"
     uv pip install --python "$VENV/bin/python" ninja packaging psutil setuptools wheel
-    log "building flash-attn $FA_TAG (MAX_JOBS=$MAX_JOBS, archs $FLASH_ATTN_CUDA_ARCHS) -- 1-2 h"
+    log "building flash-attn $FA_TAG (MAX_JOBS=$MAX_JOBS, archs $FLASH_ATTN_CUDA_ARCHS) -- 10 min to 2 h"
     ( cd "$SRC" && nice -n 10 "$VENV/bin/python" setup.py bdist_wheel --dist-dir "$WORK/wheels" )
     WHL=$(ls -t "$WORK"/wheels/flash_attn-*.whl | head -1)
     log "installing $WHL"

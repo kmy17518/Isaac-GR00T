@@ -55,7 +55,7 @@ cd $PATH_TO_BEHAVIOR_1K
   1. `uv venv` (Python 3.10) + `torch==2.10.0` / `torchvision==0.25.0` from `https://download.pytorch.org/whl/cu130` (~5 min);
   2. every other dependency at the versions of the default venv (`uv pip freeze` of `.venv`), `deepspeed==0.17.6` (pure-Python build) and the repo as an editable install;
   3. `torchcodec` 0.10.0 from source against the host FFmpeg (~10 min). CMake gets a toolchain file that pins pybind11's config dir and the Python headers/library, because pybind11 uses the unversioned `FindPython` module and torchcodec the versioned one;
-  4. `flash-attn` 2.8.3 from source with the Spark recipe's CUTLASS pin, `FLASH_ATTN_CUDA_ARCHS=100` (`sm_100` SASS runs on `sm_103`) — **1–2 h** at `MAX_JOBS=16`, deliberately throttled so a shared box stays usable;
+  4. `flash-attn` 2.8.3 from source with the Spark recipe's CUTLASS pin, `FLASH_ATTN_CUDA_ARCHS=100` (`sm_100` SASS runs on `sm_103`) — 10 min on an idle 130-core box, 1–2 h next to a running training job, at `MAX_JOBS=16` (deliberately throttled so a shared box stays usable);
   5. `flash-attn-4` (CuTe DSL, pure Python; used by `gr00t_fast` attention for padded batches — see [Training throughput knobs](#training-throughput-knobs)); `INSTALL_FA4=0` skips it;
   6. smoke tests: flash-attn varlen, torchcodec decode of a generated clip, and a `torch.compile` of a small function on the GPU.
 
