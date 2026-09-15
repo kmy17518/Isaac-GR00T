@@ -49,15 +49,20 @@ class DatasetFactory:
             desc="Initializing datasets",
         ):
             datasets = []
+            task_names = dataset_spec.task_names or None
             for dataset_path in dataset_spec.dataset_paths:
                 embodiment_tag = dataset_spec.embodiment_tag
                 assert embodiment_tag is not None, "Embodiment tag is required"
                 assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
-                # rank-0 writes stats; helper barriers before peers read them.
+                # rank-0 writes stats; helper barriers before peers read them. With a
+                # task subset the stats cover only those tasks' episodes and live in
+                # the subset's own directory under meta/.
                 with run_or_wait_on_rank0(label=f"generate_stats({dataset_path})") as is_rank0:
                     if is_rank0:
-                        generate_stats(dataset_path)
-                        generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+                        generate_stats(dataset_path, task_names=task_names)
+                        generate_rel_stats(
+                            dataset_path, EmbodimentTag(embodiment_tag), task_names=task_names
+                        )
                 dataset = ShardedSingleStepDataset(
                     dataset_path=dataset_path,
                     embodiment_tag=EmbodimentTag(embodiment_tag),
@@ -68,6 +73,7 @@ class DatasetFactory:
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
                     decode_only_used_frames=self.config.data.decode_only_used_frames,
+                    task_names=task_names,
                 )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])

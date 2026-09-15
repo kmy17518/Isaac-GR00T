@@ -7,6 +7,7 @@ import os
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.data.b1k_prompts import PromptSource, language_key
+from gr00t.data.dataset.lerobot_episode_loader import select_task_subset
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
 from gr00t.eval.eval_b1k_wrapper import load_modality_config
@@ -17,6 +18,19 @@ import tyro
 @dataclass
 class B1KFinetuneConfig(FinetuneConfig):
     """FinetuneConfig plus BEHAVIOR-1K specific options."""
+
+    task_names: list[str] | None = None
+    """Train only on these BEHAVIOR tasks (snake_case names as in ``meta/tasks.parquet``,
+    e.g. ``--task-names turning_on_radio``). Works the same whether ``--dataset-path`` is
+    the full 100-task ``2026-challenge-demos`` root or a per-task partial download of it:
+    only the selected tasks' episodes are loaded, and their normalization statistics are
+    computed over those episodes alone and kept under ``meta/task_subsets/<key>/`` (the
+    dataset-wide ``meta/stats.json`` is left untouched). Unknown names, or a dataset that
+    holds none of the selected tasks, fail fast. Default: every task under the root."""
+
+    wandb_project: str = "B1K"
+    """W&B project the run is logged to (``--wandb-project``); the run name is
+    ``--experiment-name``. Defaults to the B1K project this script has always used."""
 
     prompt_source: PromptSource | None = None
     """Which text prompt from the BEHAVIOR dataset (``meta/tasks.jsonl``) conditions the policy:
@@ -68,6 +82,16 @@ if __name__ == "__main__":
     if ft_config.modality_config_path is not None:
         load_modality_config(ft_config.modality_config_path)
 
+    # Optional task subset (--task-names): resolved eagerly against the dataset's
+    # tasks table so a typo fails here, before the model is downloaded / loaded.
+    task_names = sorted(set(ft_config.task_names)) if ft_config.task_names else None
+    if task_names is not None:
+        subset = select_task_subset(ft_config.dataset_path, task_names)
+        print(
+            f"Task subset {task_names}: {len(subset.episode_records)} episodes of "
+            f"{ft_config.dataset_path} (task indices {sorted(subset.task_indices)})"
+        )
+
     config = get_default_config().load_dict(
         {
             "data": {
@@ -77,6 +101,7 @@ if __name__ == "__main__":
                         "dataset_paths": [ft_config.dataset_path],
                         "mix_ratio": 1.0,
                         "embodiment_tag": embodiment_tag,
+                        "task_names": task_names,
                     }
                 ],
             }
@@ -120,7 +145,7 @@ if __name__ == "__main__":
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
-    config.training.wandb_project = "B1K"
+    config.training.wandb_project = ft_config.wandb_project
     config.training.experiment_name = ft_config.experiment_name
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.save_only_model = ft_config.save_only_model
