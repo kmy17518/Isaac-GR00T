@@ -27,6 +27,19 @@ cd $PATH_TO_BEHAVIOR_1K
 ./setup.sh --new-env --omnigibson --bddl --joylo --dataset --eval
 ```
 
+#### DeepSpeed on aarch64 hosts
+
+Multi-GPU training (`--num-gpus > 1`) uses DeepSpeed ZeRO-2 by default, but `pyproject.toml` pins `deepspeed` for x86_64 Linux only (no aarch64 wheels on PyPI), so `uv sync` does not install it on aarch64 and `torchrun … train_b1k.py` fails with `DeepSpeed is not available`. Two options:
+
+- **Install it from source** (pure-Python build, a few seconds; ZeRO-2 with the trainer's `adamw_torch` optimizer needs none of DeepSpeed's compiled ops):
+
+  ```
+  uv pip install --python .venv/bin/python "deepspeed==0.17.6"
+  ```
+
+  A plain `uv sync` (without `--inexact`) removes it again, so re-run this after syncing. `import deepspeed` also imports Triton's inference kernels, which JIT-build a small CPython extension on first import — the host therefore needs the CPython headers (`python3.10-dev`, or another copy of `Python.h` made visible through `CPATH`); without them the import dies with `fatal error: Python.h: No such file or directory`.
+- **Fall back to plain DDP** with `--use-ddp` on `train_b1k.py`. Every GPU then holds the full optimizer state; the trainable action head is ~1.6B of the 3.1B parameters, so this costs roughly 15–20 GB more per GPU at the same batch size than ZeRO-2 and is otherwise equivalent.
+
 The N1.7 backbone `nvidia/Cosmos-Reason2-2B` is gated. Accept the gate at [https://huggingface.co/nvidia/Cosmos-Reason2-2B](https://huggingface.co/nvidia/Cosmos-Reason2-2B) before training. 
 
 ### Finetune GR00T
