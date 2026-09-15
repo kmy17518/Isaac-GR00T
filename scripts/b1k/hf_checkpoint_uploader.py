@@ -21,7 +21,9 @@ Runs forever (in tmux) next to the training job:
      and prefix can be changed at runtime through ``<staging-dir>/upload_config.json``
      (``{"repo_id": "...", "path_prefix": "...", "enabled": true}``).
 
-State lives in ``<staging-dir>/status.json`` (human readable) and ``.uploaded`` markers.
+State lives in ``<staging-dir>/status.json`` (human readable) and destination-scoped ``.uploaded``
+markers. Changing destinations uploads the staged copies there; switching back reuses valid records.
+Unreadable markers are treated as pending, not as successful uploads.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
 import time
 
 from huggingface_hub import HfApi
@@ -165,8 +168,73 @@ def read_trainer_loss(staged: Path) -> float | None:
     return None
 
 
+def normalize_repo_path(path: str) -> str:
+    if not isinstance(path, str) or "\\" in path or ".." in path.split("/"):
+        raise ValueError("Hub paths must be relative paths without '..' or backslashes")
+    return "/".join(part for part in path.split("/") if part not in ("", "."))
+
+
 def repo_path(prefix: str, name: str) -> str:
-    return f"{prefix.strip('/')}/{name}" if prefix.strip("/") else name
+    return normalize_repo_path(f"{prefix}/{name}")
+
+
+def upload_records(checkpoint: Path) -> list[dict]:
+    try:
+        data = json.loads((checkpoint / ".uploaded").read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    if "version" in data and data["version"] != 2:
+        return []
+    records = data.get("destinations") if data.get("version") == 2 else [data]
+    if not isinstance(records, list):
+        return []
+    valid = []
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("repo_id"), str):
+            continue
+        try:
+            path = normalize_repo_path(record.get("repo_path"))
+        except ValueError:
+            continue
+        if record["repo_id"] and path:
+            valid.append({**record, "repo_path": path})
+    return valid
+
+
+def uploaded_record(checkpoint: Path, repo_id: str, prefix: str) -> dict | None:
+    dest = repo_path(prefix, checkpoint.name)
+    return next(
+        (
+            record
+            for record in upload_records(checkpoint)
+            if record["repo_id"] == repo_id and record["repo_path"] == dest
+        ),
+        None,
+    )
+
+
+def write_upload_record(checkpoint: Path, record: dict) -> None:
+    records = [
+        old
+        for old in upload_records(checkpoint)
+        if (old["repo_id"], old["repo_path"]) != (record["repo_id"], record["repo_path"])
+    ]
+    records.append(record)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=checkpoint, prefix=".uploaded.", delete=False
+        ) as f:
+            tmp = Path(f.name)
+            json.dump({"version": 2, "destinations": records}, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, checkpoint / ".uploaded")
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 FRONT_MATTER = """---
@@ -385,7 +453,7 @@ def main() -> int:
     while True:
         runtime_cfg = load_runtime_config(staging)
         repo_id = runtime_cfg.get("repo_id", args.repo_id)
-        prefix = runtime_cfg.get("path_prefix", args.path_prefix)
+        prefix = normalize_repo_path(runtime_cfg.get("path_prefix", args.path_prefix))
         uploads_enabled = bool(runtime_cfg.get("enabled", True))
 
         # ---- 1. stage completed, scheduled checkpoints ---------------------------------------
@@ -413,7 +481,7 @@ def main() -> int:
                 LOG.info("staged %s (%d files, %s) -> %s", entry.name, n_files, human(n_bytes), dst)
                 staged_now.append(entry.name)
 
-        # ---- 2. upload staged checkpoints that lack a marker ---------------------------------
+        # ---- 2. upload staged checkpoints pending at this destination ------------------------
         staged = sorted(
             (d for d in staging.iterdir() if d.is_dir() and CHECKPOINT_RE.match(d.name)),
             key=lambda d: int(CHECKPOINT_RE.match(d.name).group(1)),
@@ -421,12 +489,9 @@ def main() -> int:
         uploaded: dict[str, dict] = {}
         pending = []
         for d in staged:
-            marker = d / ".uploaded"
-            if marker.exists():
-                try:
-                    uploaded[d.name] = json.loads(marker.read_text())
-                except (OSError, json.JSONDecodeError):
-                    uploaded[d.name] = {}
+            record = uploaded_record(d, repo_id, prefix)
+            if record is not None:
+                uploaded[d.name] = record
             else:
                 pending.append(d)
 
@@ -449,6 +514,7 @@ def main() -> int:
                         path_in_repo=dest,
                         repo_id=repo_id,
                         repo_type="model",
+                        ignore_patterns=[".uploaded", ".uploaded.*"],
                         commit_message=f"Add {dest} ({args.experiment_name})",
                     )
                     rec = {
@@ -459,7 +525,7 @@ def main() -> int:
                         "train_loss": read_trainer_loss(d),
                         "seconds": round(time.time() - t0, 1),
                     }
-                    (d / ".uploaded").write_text(json.dumps(rec, indent=2))
+                    write_upload_record(d, rec)
                     uploaded[d.name] = rec
                     LOG.info("uploaded %s in %.0fs: %s", dest, rec["seconds"], rec["commit_url"])
                     # refresh both model cards after every checkpoint
