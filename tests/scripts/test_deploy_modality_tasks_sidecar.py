@@ -107,10 +107,12 @@ class TestEnsureTasksSidecar:
         assert errors and "picking_up_garbage" in errors[0]
         assert not (partial / "meta" / "tasks.jsonl").exists()
 
+        # A reference superset is valid for partial downloads; only canonical IDs are installed.
         extra = tmp_path / "extra.jsonl"
         _write_jsonl(extra, TASKS + [{"task_index": 2, "task_name": "can_meat", "task": "x"}])
         status, errors = deploy_modality.ensure_tasks_sidecar(partial, template, extra, False)
-        assert status == "skipped" and "task indices differ" in errors[0]
+        assert (status, errors) == ("installed", [])
+        assert deploy_modality._load_jsonl(partial / "meta/tasks.jsonl") == TASKS
 
     def test_v21_layout_is_left_to_the_loader(self, deploy_modality, template, tmp_path, sidecar):
         v21 = tmp_path / "v21"
@@ -138,3 +140,150 @@ class TestEnsureTasksSidecar:
             )
             == []
         )
+
+
+def test_enrich_converted_subset_preserves_canonical_text(
+    deploy_modality, template, sidecar, tmp_path
+):
+    dataset = tmp_path / "converted"
+    path = dataset / "meta/tasks.jsonl"
+    original = [{"task_index": 1, "task": TASKS[1]["task_name"], "custom": "keep"}]
+    _write_jsonl(path, original)
+    before = path.read_bytes()
+    assert deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, True) == ("planned", [])
+    assert path.read_bytes() == before
+    assert deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False) == (
+        "enriched",
+        [],
+    )
+    rows = deploy_modality._load_jsonl(path)
+    assert rows == [
+        {**original[0], "task_name": TASKS[1]["task_name"], "task_description": TASKS[1]["task"]}
+    ]
+    deployed = deploy_modality._dataset_template(dataset, template)
+    assert deployed["annotation"]["human.task_description"]["task_field"] == "task_description"
+    assert template["annotation"]["human.task_description"]["task_field"] == "task"
+    assert deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False) == (
+        "present",
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_rows",
+    [
+        [{"task_index": 0, "task": "wrong_name"}],
+        [{"task_index": 10, "task": "turning_on_radio"}],
+        [{"task_index": 0, "task": "turning_on_radio"}] * 2,
+        [
+            {"task_index": 0, "task": "turning_on_radio", "task_name": "wrong_name"},
+            {"task_index": 1, "task": "picking_up_trash"},
+        ],
+    ],
+)
+def test_rejects_converted_mismatches_without_overwrite(
+    deploy_modality, template, sidecar, tmp_path, bad_rows
+):
+    dataset = tmp_path / "converted"
+    path = dataset / "meta/tasks.jsonl"
+    _write_jsonl(path, bad_rows)
+    before = path.read_bytes()
+    status, errors = deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False)
+    assert status == "skipped" and errors
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("table", ["parquet", "reference", "existing"])
+def test_duplicate_ids_are_rejected(deploy_modality, template, partial, sidecar, table):
+    if table == "parquet":
+        pd.DataFrame(
+            {"task_index": [0, 0]}, index=pd.Index([t["task_name"] for t in TASKS], name="task")
+        ).to_parquet(partial / "meta/tasks.parquet")
+    elif table == "reference":
+        _write_jsonl(sidecar, TASKS + TASKS[:1])
+    else:
+        _write_jsonl(partial / "meta/tasks.jsonl", TASKS + TASKS[:1])
+    status, errors = deploy_modality.ensure_tasks_sidecar(partial, template, sidecar, False)
+    assert status == "skipped" and "duplicate task_index" in errors[0]
+
+
+def test_valid_custom_sidecar_is_not_replaced(deploy_modality, template, sidecar, tmp_path):
+    dataset = tmp_path / "converted"
+    path = dataset / "meta/tasks.jsonl"
+    _write_jsonl(
+        path, [{"task_index": 0, "task_name": "custom_name", "task": "Custom instruction."}]
+    )
+    before = path.read_bytes()
+    assert deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False) == (
+        "present",
+        [],
+    )
+    assert path.read_bytes() == before
+
+
+def test_reference_partial_subset_and_missing_ids(deploy_modality, template, tmp_path, sidecar):
+    dataset = tmp_path / "subset"
+    (dataset / "meta").mkdir(parents=True)
+    pd.DataFrame(
+        {"task_index": [1]}, index=pd.Index([TASKS[1]["task_name"]], name="task")
+    ).to_parquet(dataset / "meta/tasks.parquet")
+    assert deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False) == (
+        "installed",
+        [],
+    )
+    assert deploy_modality._load_jsonl(dataset / "meta/tasks.jsonl") == TASKS[1:]
+    (dataset / "meta/tasks.jsonl").unlink()
+    _write_jsonl(sidecar, TASKS[:1])
+    status, errors = deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False)
+    assert status == "skipped" and "missing [1]" in errors[0]
+    assert not (dataset / "meta/tasks.jsonl").exists()
+
+
+def test_existing_full_sidecar_is_valid_with_partial_parquet(
+    deploy_modality, template, partial, sidecar
+):
+    pd.DataFrame(
+        {"task_index": [0]}, index=pd.Index([TASKS[0]["task_name"]], name="task")
+    ).to_parquet(partial / "meta/tasks.parquet")
+    path = partial / "meta/tasks.jsonl"
+    path.write_bytes(sidecar.read_bytes())
+    before = path.read_bytes()
+    assert deploy_modality.ensure_tasks_sidecar(partial, template, sidecar, False) == (
+        "present",
+        [],
+    )
+    assert path.read_bytes() == before
+
+
+def test_atomic_enrichment_failure_preserves_original(
+    deploy_modality, template, sidecar, tmp_path, monkeypatch
+):
+    dataset = tmp_path / "converted"
+    path = dataset / "meta/tasks.jsonl"
+    _write_jsonl(path, [{"task_index": 0, "task": "turning_on_radio"}])
+    before = path.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(deploy_modality.os, "replace", fail_replace)
+    status, errors = deploy_modality.ensure_tasks_sidecar(dataset, template, sidecar, False)
+    assert status == "skipped" and "interrupted" in errors[0]
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob(".tasks.jsonl.*"))
+
+
+def test_invalid_dataset_does_not_rewrite_sidecar_or_modality(
+    deploy_modality, template, tmp_path, sidecar, monkeypatch
+):
+    dataset = tmp_path / "converted"
+    path = dataset / "meta/tasks.jsonl"
+    _write_jsonl(path, [{"task_index": 0, "task": "turning_on_radio"}])
+    (dataset / "meta/info.json").write_text('{"features": {}}')
+    modality = dataset / "meta/modality.json"
+    modality.write_text("existing metadata")
+    before = path.read_bytes()
+    monkeypatch.setattr(sys, "argv", ["deploy", str(dataset), "--tasks-file", str(sidecar)])
+    assert deploy_modality.main() == 1
+    assert path.read_bytes() == before
+    assert modality.read_text() == "existing metadata"
