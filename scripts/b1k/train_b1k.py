@@ -1,14 +1,59 @@
 # Launch finetuning for N1.7 on "single node".
 # This script tries to provide a similar user experience as current OSS.
 
+from dataclasses import dataclass
 import os
-import tyro
 
 from gr00t.configs.base_config import get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
+from gr00t.data.b1k_prompts import PromptSource, language_key
 from gr00t.data.embodiment_tags import EmbodimentTag
+from gr00t.data.types import ModalityConfig
 from gr00t.eval.eval_b1k_wrapper import load_modality_config
 from gr00t.experiment.experiment import run
+import tyro
+
+
+@dataclass
+class B1KFinetuneConfig(FinetuneConfig):
+    """FinetuneConfig plus BEHAVIOR-1K specific options."""
+
+    prompt_source: PromptSource | None = None
+    """Which text prompt from the BEHAVIOR dataset (``meta/tasks.jsonl``) conditions the policy:
+    ``task_description`` -- natural-language instruction, e.g. "Turn on the radio receiver that's on
+    the table in the living room."; ``task_name`` -- snake_case identifier, e.g. "turning_on_radio".
+    Overrides the language key declared by the modality config (``--modality-config-path``, e.g.
+    ``examples/b1k/r1pro.py``, whose default is ``task_name``). Either way the chosen key is
+    saved in the checkpoint's processor config, and ``serve_b1k.py`` reads it back from there."""
+
+
+def select_prompt_source(modality_configs: dict, embodiment_tag: str, prompt_source: str) -> str:
+    """Point ``modality_configs[embodiment_tag]["language"]`` at the ``prompt_source`` key.
+
+    Returns the selected language key. Mutates the (shared) modality config dict in
+    place so the dataset loader and the processor both see the same key.
+    """
+    key = language_key(prompt_source)
+    if embodiment_tag not in modality_configs:
+        raise ValueError(
+            f"No modality config registered for embodiment tag '{embodiment_tag}'; pass "
+            "--modality-config-path (e.g. examples/b1k/r1pro.py) so the B1K language keys exist."
+        )
+    previous = modality_configs[embodiment_tag]["language"]
+    modality_configs[embodiment_tag]["language"] = ModalityConfig(
+        delta_indices=list(previous.delta_indices),
+        modality_keys=[key],
+    )
+    return key
+
+
+def resolve_language_key(
+    modality_configs: dict, embodiment_tag: str, prompt_source: str | None
+) -> str:
+    """Language key to train on: ``--prompt-source`` if given, else the modality config's own."""
+    if prompt_source is not None:
+        return select_prompt_source(modality_configs, embodiment_tag, prompt_source)
+    return modality_configs[embodiment_tag]["language"].modality_keys[0]
 
 
 if __name__ == "__main__":
@@ -16,7 +61,7 @@ if __name__ == "__main__":
     if "LOGURU_LEVEL" not in os.environ:
         os.environ["LOGURU_LEVEL"] = "INFO"
     # Use tyro for clean CLI
-    ft_config = tyro.cli(FinetuneConfig, description=__doc__)
+    ft_config = tyro.cli(B1KFinetuneConfig, description=__doc__)
     embodiment_tag = EmbodimentTag.resolve(ft_config.embodiment_tag).value
 
     # all rank workers should register for the modality config
@@ -38,6 +83,14 @@ if __name__ == "__main__":
         }
     )
     config.load_config_path = None
+
+    # Kind of B1K text prompt to train on (see gr00t.data.b1k_prompts): the modality
+    # config's language key unless --prompt-source overrides it. The checkpoint's
+    # processor config records the result for serve_b1k.py.
+    selected_language_key = resolve_language_key(
+        config.data.modality_configs, embodiment_tag, ft_config.prompt_source
+    )
+    print(f"Language key: {selected_language_key} (--prompt-source {ft_config.prompt_source})")
 
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm

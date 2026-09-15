@@ -64,7 +64,14 @@
     },
     "annotation": {
         "human.task_description": {
-            "original_key": "task_index"
+            "original_key": "task_index",
+            "tasks_file": "tasks.jsonl",
+            "task_field": "task"
+        },
+        "human.task_name": {
+            "original_key": "task_index",
+            "tasks_file": "tasks.jsonl",
+            "task_field": "task_name"
         }
     }
 }

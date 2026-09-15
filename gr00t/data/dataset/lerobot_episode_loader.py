@@ -70,6 +70,29 @@ LEROBOT_V30_TASKS_FILENAME = "tasks.parquet"
 DEFAULT_V30_TABLE_CACHE_SIZE = 4
 DEFAULT_V30_VIDEO_CACHE_SIZE = 8
 
+# Optional per-key fields of the ``annotation`` section of ``meta/modality.json``.
+# A language key ``annotation.<subkey>`` reads an integer task index from the data
+# column ``original_key`` and resolves it to text through a tasks table:
+#
+#     "annotation": {
+#         "human.task_description": {
+#             "original_key": "task_index",  # data column holding the task index
+#             "tasks_file": "tasks.jsonl",   # meta/ table to resolve it in
+#             "task_field": "task"           # field of that table holding the text
+#         }
+#     }
+#
+# Both fields are optional. ``tasks_file`` defaults to the canonical LeRobot
+# tasks table of the dataset version (``tasks.parquet`` for v3.0, ``tasks.jsonl``
+# for v2.x) and ``task_field`` to ``task``, which reproduces stock LeRobot
+# behavior. Datasets that ship several kinds of text per task (e.g. the
+# BEHAVIOR challenge demos, whose ``meta/tasks.jsonl`` carries both a snake_case
+# ``task_name`` and a natural-language ``task`` description) expose each kind
+# under its own annotation key and let the modality config pick one.
+ANNOTATION_TASKS_FILE_KEY = "tasks_file"
+ANNOTATION_TASK_FIELD_KEY = "task_field"
+DEFAULT_TASK_FIELD = "task"
+
 ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
@@ -183,8 +206,8 @@ class LeRobotEpisodeLoader:
 
         Parses the standard LeRobot metadata structure:
         - info.json: Dataset configuration and file patterns
-        - episodes.jsonl: Per-episode metadata (length, timestamps, etc.)
-        - tasks.jsonl: Task descriptions and mappings
+        - episodes.jsonl (v2.x) / episodes/*.parquet (v3.0): Per-episode metadata
+        - tasks.jsonl (v2.x) / tasks.parquet (v3.0): Task index -> text mappings
         - modality.json: Modality structure and data layout
         - stats.json: Dataset statistics for normalization
         """
@@ -201,18 +224,24 @@ class LeRobotEpisodeLoader:
 
         if self.is_v30:
             self.episodes_metadata = self._load_episodes_metadata_v30(meta_dir)
-            self.tasks_map = self._load_tasks_v30(meta_dir)
+            self.tasks_filename = LEROBOT_V30_TASKS_FILENAME
         else:
             # Load episode metadata (one episode per line)
             episodes_path = meta_dir / LEROBOT_EPISODES_FILENAME
             with open(episodes_path, "r") as f:
                 self.episodes_metadata = [json.loads(line) for line in f]
+            self.tasks_filename = LEROBOT_TASKS_FILENAME
 
-            # Load task descriptions and create mapping
-            tasks_path = meta_dir / LEROBOT_TASKS_FILENAME
-            with open(tasks_path, "r") as f:
-                tasks_data = [json.loads(line) for line in f]
-                self.tasks_map = {task["task_index"]: task["task"] for task in tasks_data}
+        # Canonical task-index -> task-string map (LeRobot's ``task`` field). Extra
+        # tasks tables / text fields referenced by modality.json annotation keys
+        # are loaded lazily and cached in ``_tasks_tables`` (see
+        # ``_get_annotation_text_map``).
+        self._tasks_tables: dict[str, dict[int, dict[str, Any]]] = {}
+        self._annotation_text_maps: dict[str, dict[int, str]] = {}
+        self.tasks_map = {
+            task_index: str(row[DEFAULT_TASK_FIELD])
+            for task_index, row in self._get_tasks_table(self.tasks_filename).items()
+        }
 
         # Index episode records by their episode_index
         self._episode_by_index = {int(ep["episode_index"]): ep for ep in self.episodes_metadata}
@@ -282,17 +311,65 @@ class LeRobotEpisodeLoader:
         records.sort(key=lambda record: int(record["episode_index"]))
         return records
 
-    def _load_tasks_v30(self, meta_dir: Path) -> dict[int, str]:
-        """Load the task-index -> task-string map from ``meta/tasks.parquet``.
+    def _load_tasks_table(self, filename: str) -> dict[int, dict[str, Any]]:
+        """Load ``meta/<filename>`` as a ``task_index -> row`` table.
 
-        v3.0 stores tasks as parquet with an integer ``task_index`` column. The
-        task string may be either a regular ``task`` column or the (named) index,
-        depending on the writer; both layouts are normalized here.
+        Supports both LeRobot layouts: JSONL (v2.x ``tasks.jsonl``, one object per
+        line, possibly carrying extra text fields next to ``task``) and v3.0
+        parquet, where the task string may be either a regular ``task`` column or
+        the (named) index depending on the writer; both are normalized here.
         """
-        tasks_df = pq.read_table(meta_dir / LEROBOT_V30_TASKS_FILENAME).to_pandas()
-        if tasks_df.index.name == "task":
-            tasks_df = tasks_df.reset_index()
-        return {int(row["task_index"]): str(row["task"]) for _, row in tasks_df.iterrows()}
+        path = self.dataset_path / LEROBOT_META_DIR_NAME / filename
+        if not path.exists():
+            raise FileNotFoundError(f"Tasks table {path} does not exist for {self.dataset_path}")
+        if path.suffix == ".parquet":
+            tasks_df = pq.read_table(path).to_pandas()
+            if tasks_df.index.name == DEFAULT_TASK_FIELD:
+                tasks_df = tasks_df.reset_index()
+            rows = tasks_df.to_dict(orient="records")
+        elif path.suffix == ".jsonl":
+            with open(path, "r") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        else:
+            raise ValueError(f"Unsupported tasks table format {path.suffix!r}: {path}")
+        return {int(row["task_index"]): row for row in rows}
+
+    def _get_tasks_table(self, filename: str) -> dict[int, dict[str, Any]]:
+        """Cached :meth:`_load_tasks_table`."""
+        if filename not in self._tasks_tables:
+            self._tasks_tables[filename] = self._load_tasks_table(filename)
+        return self._tasks_tables[filename]
+
+    def _get_annotation_text_map(self, subkey: str) -> dict[int, str]:
+        """Resolve the ``task_index -> text`` map for the language key ``annotation.<subkey>``.
+
+        The tasks table and text field come from the key's entry in
+        ``meta/modality.json`` (``tasks_file`` / ``task_field``, see the module
+        constants); defaults reproduce stock LeRobot behavior (canonical table,
+        ``task`` field). Raises if the table lacks the requested field so a
+        misconfigured prompt source fails loudly instead of training on the wrong text.
+        """
+        if subkey in self._annotation_text_maps:
+            return self._annotation_text_maps[subkey]
+
+        annotation_meta = self.modality_meta["annotation"][subkey]
+        tasks_file = annotation_meta.get(ANNOTATION_TASKS_FILE_KEY, self.tasks_filename)
+        task_field = annotation_meta.get(ANNOTATION_TASK_FIELD_KEY, DEFAULT_TASK_FIELD)
+        table = self._get_tasks_table(tasks_file)
+
+        text_map: dict[int, str] = {}
+        for task_index, row in table.items():
+            if task_field not in row or row[task_field] is None:
+                available = sorted(k for k in row.keys() if k != "task_index")
+                raise KeyError(
+                    f"Language key 'annotation.{subkey}' asks for field {task_field!r} of "
+                    f"meta/{tasks_file}, but task_index {task_index} has no such field "
+                    f"(available: {available}). Fix the 'annotation' entry in meta/modality.json "
+                    f"or regenerate meta/{tasks_file}."
+                )
+            text_map[task_index] = str(row[task_field])
+        self._annotation_text_maps[subkey] = text_map
+        return text_map
 
     def _init_v30_caches(self, data_cache_size: int | None, video_cache_size: int | None) -> None:
         """Set up the v3.0 per-file parquet table cache and video decoder pool.
@@ -610,8 +687,11 @@ class LeRobotEpisodeLoader:
                     f"Key {subkey} not found in language modality"
                 )
                 original_key = self.modality_meta["annotation"][subkey].get("original_key", key)
+                # Which tasks table / text field the index resolves through is
+                # configured per annotation key in modality.json.
+                text_map = self._get_annotation_text_map(subkey)
                 loaded_df[f"language.{key}"] = original_df[original_key].apply(
-                    lambda x: self.tasks_map[x]
+                    lambda x: text_map[int(x)]
                 )
 
         # Extract joint groups for state and action modalities

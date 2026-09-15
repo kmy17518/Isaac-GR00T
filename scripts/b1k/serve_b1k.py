@@ -2,7 +2,13 @@ from dataclasses import dataclass
 import json
 import os
 
-from gr00t.data.b1k_prompts import DEFAULT_TASKS_FILE, find_b1k_task, load_b1k_tasks
+from gr00t.data.b1k_prompts import (
+    DEFAULT_TASKS_FILE,
+    PromptSource,
+    find_b1k_task,
+    load_b1k_tasks,
+    prompt_source_from_language_key,
+)
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.eval.eval_b1k_wrapper import B1KPolicyWrapper, load_modality_config
 from gr00t.policy.gr00t_policy import Gr00tPolicy
@@ -42,6 +48,10 @@ class ServerConfig:
     """``tasks.jsonl`` with the challenge task names and descriptions (repo copy of the
     dataset's ``meta/tasks.jsonl``; a dataset's own file works too)."""
 
+    prompt_source: PromptSource | None = None
+    """Kind of text to prompt with: ``task_description`` (natural language) or ``task_name``
+    (snake_case). Default: the kind the checkpoint was trained on, read from its language key."""
+
     text_prompt: str | None = None
     """Explicit prompt for every request; bypasses --task-name / task_id / --tasks-file."""
 
@@ -56,21 +66,35 @@ class ServerConfig:
     """Whether to enforce strict input and output validation"""
 
 
-def resolve_prompts(config: ServerConfig) -> tuple[str | None, dict[int, str] | None]:
+def resolve_prompts(
+    config: ServerConfig, language_key: str
+) -> tuple[str | None, dict[int, str] | None]:
     """Turn the CLI prompt options into ``(text_prompt, task_prompts)`` for B1KPolicyWrapper.
 
-    The prompt is the task's natural-language description from ``--tasks-file``.
+    ``language_key`` is the checkpoint's language modality key; it decides which kind of
+    text (description vs. name) to feed unless ``--prompt-source`` overrides it.
     """
     if config.text_prompt is not None:
         return config.text_prompt, None
 
+    prompt_source = config.prompt_source
+    if prompt_source is None:
+        try:
+            prompt_source = prompt_source_from_language_key(language_key)
+        except ValueError as e:
+            raise ValueError(
+                f"{e}. Cannot infer which kind of text this checkpoint was trained on; "
+                "pass --prompt-source or --text-prompt explicitly."
+            ) from e
+    print(f"  Prompt source: {prompt_source} (checkpoint language key: {language_key})")
+
     tasks = load_b1k_tasks(config.tasks_file)
     if config.task_name is not None:
-        text_prompt = find_b1k_task(tasks, config.task_name).task_description
+        text_prompt = find_b1k_task(tasks, config.task_name).prompt(prompt_source)
         print(f"  Prompt (fixed, task {config.task_name}): {text_prompt!r}")
         return text_prompt, None
 
-    task_prompts = {task_index: task.task_description for task_index, task in tasks.items()}
+    task_prompts = {task_index: task.prompt(prompt_source) for task_index, task in tasks.items()}
     print(f"  Prompt: resolved per request from the evaluator's task_id ({len(task_prompts)} tasks)")
     return None, task_prompts
 
@@ -106,9 +130,10 @@ def main(config: ServerConfig):
         strict=config.strict,
     )
 
-    text_prompt, task_prompts = resolve_prompts(config)
+    # Prompt with the same kind of text the checkpoint was trained on.
+    text_prompt, task_prompts = resolve_prompts(config, policy.language_key)
 
-    # Wrap with B1K policy wrapper (feeds the prompt under the checkpoint's language key)
+    # Wrap with B1K policy wrapper
     policy = B1KPolicyWrapper(
         policy=policy,
         embodiment_tag=config.embodiment_tag,

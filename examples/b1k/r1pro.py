@@ -23,11 +23,23 @@ Action groups (slices of the 23-dim ``action``, absolute joint targets):
     right_arm      [15:22]  right arm targets, relative to state.right_arm
     right_gripper  [22:23]  right gripper command
 
+Language: the dataset ships two kinds of text per task in ``meta/tasks.jsonl``
+(see ``gr00t.data.b1k_prompts``), each exposed by ``r1pro.json`` as its own
+annotation key so the modality config can pick one:
+    annotation.human.task_name         snake_case identifier, e.g. "turning_on_radio"
+                                       (default)
+    annotation.human.task_description  natural-language instruction, e.g.
+                                       "Turn on the radio receiver that's on the
+                                       table in the living room."
+``scripts/b1k/train_b1k.py --prompt-source`` overrides the default below; the
+checkpoint records the chosen key so ``serve_b1k.py`` prompts with the same kind.
+
 ``name`` and ``observation`` are read by ``B1KPolicyWrapper`` to locate the live
 OmniGibson proprio/camera obs keys (robot name ``robot_r1``).
 """
 
 from gr00t.configs.data.embodiment_configs import register_modality_config
+from gr00t.data.b1k_prompts import DEFAULT_PROMPT_SOURCE, language_key
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import (
     ActionConfig,
@@ -110,7 +122,7 @@ b1k_r1pro_config = {
     ),
     "language": ModalityConfig(
         delta_indices=[0],
-        modality_keys=["annotation.human.task_description"],
+        modality_keys=[language_key(DEFAULT_PROMPT_SOURCE)],  # annotation.human.task_name
     ),
 }
 

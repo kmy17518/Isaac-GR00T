@@ -64,7 +64,7 @@ cd ../..                       # back to the repo root
 source .venv/bin/activate      # re-activate the GR00T venv (conversion used its own)
 ```
 
-The conversion carries `meta/tasks.jsonl` over verbatim (task ids *and* natural-language descriptions), preserving the source task metadata on a converted dataset; `episodes.jsonl` uses the same task strings as `tasks.jsonl`, as LeRobot v2.1 expects.
+The conversion carries `meta/tasks.jsonl` over verbatim (task ids *and* natural-language descriptions), so both `--prompt-source` options keep working on a converted dataset; `episodes.jsonl` uses the same task strings as `tasks.jsonl`, as LeRobot v2.1 expects.
 
 #### Deploy modality.json
 
@@ -73,6 +73,8 @@ Before we can run training, we need GR00T-specific `meta/modality.json`. Deploy 
 ```
 python scripts/b1k/deploy_modality.py $DATA_ROOT
 ```
+
+The per-task partial download does not include `meta/tasks.jsonl`, the table both `--prompt-source` options read (see [Language prompt](#language-prompt)); when it is missing from a v3.0 dataset, `deploy_modality.py` installs the repo's verbatim copy (`examples/b1k/tasks.jsonl`) after checking it against the dataset's `meta/tasks.parquet`, and reports `[write] .../meta/tasks.jsonl`.
 
 Normalization statistics (`meta/stats.json`) are generated automatically on the first training run.
 
@@ -114,6 +116,17 @@ Checkpoints land in `$OUTPUT_DIR/b1k-$TASK/checkpoint-<step>/`, each one standal
 
 **Tune** `OMP_NUM_THREADS` **and** `--dataloader-num-workers` **to your CPU.**
 
+#### Language prompt
+
+The challenge demos carry two kinds of text per task in `meta/tasks.jsonl`. The policy is conditioned on one of them:
+
+| Prompt source          | Text fed to the model (before lower-casing / punctuation stripping)               |
+| ---------------------- | --------------------------------------------------------------------------------- |
+| `task_name` (default)  | `turning_on_radio` (the snake_case task id, what LeRobot's `tasks.parquet` holds) |
+| `task_description`     | `Turn on the radio receiver that's on the table in the living room.`              |
+
+Each kind is an annotation key in `examples/b1k/r1pro.json` (`annotation.human.task_name` / `annotation.human.task_description`, both resolved from `meta/tasks.jsonl`, which `deploy_modality.py` validates). The shared modality config `examples/b1k/r1pro.py` — passed to both `train_b1k.py` and `serve_b1k.py` — sets the default; `--prompt-source task_description|task_name` overrides it for one training run. Whichever wins is saved in the checkpoint (`checkpoint-<step>/processor_config.json`, `modality_configs.new_embodiment.language.modality_keys`), so `serve_b1k.py` automatically prompts with the same kind of text — see [Evaluation](#evaluation).
+
 ### Evaluation
 
 After finetuning, you can run evaluation by following the steps below:
@@ -128,6 +141,8 @@ After finetuning, you can run evaluation by following the steps below:
         --host 127.0.0.1 --port 8000
   ```
     This opens a connection listening on 127.0.0.1:8000. Health-check it with `curl -s http://127.0.0.1:8000/healthz` (returns `OK`).
+
+    The server prompts the policy with the same kind of text it was trained on (read from the checkpoint's language key) and resolves the task text per request from the `task_id` the evaluator sends, using the task table in `examples/b1k/tasks.jsonl` (a copy of the dataset's `meta/tasks.jsonl`). Overrides: `--task-name turning_on_radio` fixes the prompt to one task, `--prompt-source task_name|task_description` forces the kind of text, `--text-prompt "..."` sets it verbatim. Checkpoints trained before `--prompt-source` existed saw task names under the `task_description` key; serve them with `--prompt-source task_name`.
 2. Run the evaluation on BEHAVIOR:
   Assume you have behavior env installed (check [https://github.com/StanfordVL/BEHAVIOR-1K](https://github.com/StanfordVL/BEHAVIOR-1K) for more details), run the following command within the BEHAVIOR-1K directory:
 

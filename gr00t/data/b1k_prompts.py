@@ -1,7 +1,7 @@
 """Text prompts of the BEHAVIOR-1K (B1K) challenge dataset.
 
-The challenge demos (``behavior-1k/2026-challenge-demos``) describe every task in
-``meta/tasks.jsonl``::
+The challenge demos (``behavior-1k/2026-challenge-demos``) ship two kinds of text
+per task in ``meta/tasks.jsonl``::
 
     {
         "task_index": 0,
@@ -9,11 +9,17 @@ The challenge demos (``behavior-1k/2026-challenge-demos``) describe every task i
         "task": "Turn on the radio receiver that's on the table in the living room.",
     }
 
-``task`` is the natural-language instruction; ``task_name`` the snake_case task id
-(also what LeRobot's canonical ``meta/tasks.parquet`` stores as the task string).
-The OmniGibson evaluator identifies the running task by ``task_index`` (sent as
-``task_id`` with every observation), so serving resolves the prompt through this
-table (``scripts/b1k/serve_b1k.py``).
+* ``task_description`` -- the natural-language instruction (``task`` field).
+* ``task_name`` -- the snake_case task identifier (``task_name`` field). This is
+  also what LeRobot's canonical ``meta/tasks.parquet`` stores as the task string.
+
+Each kind is exposed to the GR00T data loader as its own language annotation key
+(``annotation.human.<kind>``, declared in ``examples/b1k/r1pro.json``). The shared
+modality config (``examples/b1k/r1pro.py``, passed to both training and serving)
+picks the kind a model is trained on through ``language.modality_keys``;
+``scripts/b1k/train_b1k.py --prompt-source`` overrides it per run. The checkpoint's
+processor config records the resulting key, and serving (``scripts/b1k/serve_b1k.py``)
+reads it back so the policy is prompted with the same kind of text it was trained on.
 """
 
 from __future__ import annotations
@@ -21,15 +27,54 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Literal, get_args
 
 
-# Field of ``meta/tasks.jsonl`` that holds each kind of text.
+PromptSource = Literal["task_description", "task_name"]
+PROMPT_SOURCES: tuple[str, ...] = get_args(PromptSource)
+DEFAULT_PROMPT_SOURCE: PromptSource = "task_name"
+
+# ``annotation.human.<prompt source>`` is the language modality key for each kind.
+LANGUAGE_KEY_PREFIX = "annotation.human."
+
+# Field of ``meta/tasks.jsonl`` that holds each kind of prompt.
 TASK_FIELDS: dict[str, str] = {"task_description": "task", "task_name": "task_name"}
 
 # Verbatim copy of the dataset's ``meta/tasks.jsonl`` (MIT licensed), so a policy can
 # be served without the demos on disk. Regenerate with:
 #   cp $DATA_ROOT/meta/tasks.jsonl examples/b1k/tasks.jsonl
 DEFAULT_TASKS_FILE = Path(__file__).resolve().parents[2] / "examples" / "b1k" / "tasks.jsonl"
+
+
+def validate_prompt_source(prompt_source: str) -> PromptSource:
+    if prompt_source not in PROMPT_SOURCES:
+        raise ValueError(
+            f"Unknown B1K prompt source {prompt_source!r}; expected one of {list(PROMPT_SOURCES)}"
+        )
+    return prompt_source  # type: ignore[return-value]
+
+
+def language_key(prompt_source: str) -> str:
+    """Language modality key that trains on ``prompt_source``.
+
+    >>> language_key("task_name")
+    'annotation.human.task_name'
+    """
+    return f"{LANGUAGE_KEY_PREFIX}{validate_prompt_source(prompt_source)}"
+
+
+def prompt_source_from_language_key(key: str) -> PromptSource:
+    """Inverse of :func:`language_key`.
+
+    Raises ``ValueError`` if ``key`` does not denote one of the B1K prompt kinds, so
+    callers can fall back to an explicit prompt instead of guessing.
+    """
+    if key.startswith(LANGUAGE_KEY_PREFIX) and key[len(LANGUAGE_KEY_PREFIX) :] in PROMPT_SOURCES:
+        return key[len(LANGUAGE_KEY_PREFIX) :]  # type: ignore[return-value]
+    raise ValueError(
+        f"Language key {key!r} is not a B1K prompt key; expected one of "
+        f"{[language_key(s) for s in PROMPT_SOURCES]}"
+    )
 
 
 @dataclass(frozen=True)
@@ -39,6 +84,10 @@ class B1KTask:
     task_index: int
     task_name: str
     task_description: str
+
+    def prompt(self, prompt_source: str) -> str:
+        """The text of kind ``prompt_source`` for this task."""
+        return getattr(self, validate_prompt_source(prompt_source))
 
 
 def load_b1k_tasks(tasks_file: str | Path = DEFAULT_TASKS_FILE) -> dict[int, B1KTask]:
