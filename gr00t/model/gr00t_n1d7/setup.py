@@ -81,6 +81,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         return {
             name: getattr(self.config.model, name)
             for name in (
+                "backbone_attn_implementation",
+                "sdpa_backend_priority",
+                "fast_vl_patch_embed",
                 "fast_vl_position_ids",
                 "collate_pixel_values_dtype",
             )

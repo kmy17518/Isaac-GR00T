@@ -52,6 +52,16 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Batched (bitwise-identical) Qwen3-VL position-id / vision position computations instead of
     # the stock per-sample / per-image Python loops, which make large batches CPU-bound.
     fast_vl_position_ids: bool = True
+    # Run the Qwen3-VL vision patch embedding (a Conv3d whose kernel is the whole patch) as the
+    # equivalent F.linear -- same math; cuDNN's kernel for that convolution is ~50x slower on Blackwell.
+    fast_vl_patch_embed: bool = True
+    # transformers attention implementation for the VLM backbone: None = flash_attention_2 if
+    # installed else sdpa; "gr00t_fast" = cuDNN/SDPA for regular batches and packed image segments,
+    # FlashAttention (4 if installed) varlen for padded batches (gr00t.model.modules.fast_attention).
+    backbone_attn_implementation: str | None = None
+    # Global torch SDPA backend order, e.g. "cudnn,efficient,flash,math" (torch's default puts cuDNN
+    # last; on Blackwell it is the fastest for the DiT's shapes). None = torch default.
+    sdpa_backend_priority: str | None = None
     # How the data collator emits `pixel_values` (None = the VLM processor's float32). "bfloat16":
     # normalized patches in bf16 (half the host/shm/H2D traffic; bit-identical whenever the vision
     # tower computes in bf16). "uint8": unnormalized uint8 patches (a quarter of the bytes), with the
