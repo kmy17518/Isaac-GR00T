@@ -35,6 +35,7 @@ from gr00t.experiment.dist_utils import run_on_rank0, run_or_wait_on_rank0
 from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
 from gr00t.experiment.utils import BestMetricCheckpointCallback, CheckpointFormatCallback
 from gr00t.model import MODEL_REGISTRY
+from gr00t.model.modules.compile_blocks import check_training_compile_compatibility
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, save_initial_actions
 
 
@@ -178,6 +179,7 @@ def run(config: Config):
     """Main training function."""
     warn_configs(config)
     check_resume_compatibility(config.training)
+    check_training_compile_compatibility(config.training)
 
     global_rank = _init_distributed_process_group()
 

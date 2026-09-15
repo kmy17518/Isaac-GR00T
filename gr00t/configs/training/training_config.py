@@ -96,7 +96,8 @@ class TrainingConfig:
     # torch.compile of the model's repeated transformer blocks (see gr00t.model.modules.compile_blocks):
     # comma-separated subset of "vision,llm,dit,vlsa", None = eager. Training-only; not saved with
     # the model, so serving stays eager. Needs a Triton/Inductor that supports the GPU (on B300 /
-    # sm_103 that means torch >= 2.9 with CUDA 13 wheels).
+    # sm_103 that means torch >= 2.9 with CUDA 13 wheels). Multi-GPU DeepSpeed permits
+    # only "dit" or "vlsa" individually; their combination has a gradient corruption regression.
     compile_blocks: str | None = None
     compile_mode: str | None = None  # torch.compile mode, e.g. "max-autotune-no-cudagraphs"
     compile_coordinate_descent: bool = (
