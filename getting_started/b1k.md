@@ -64,6 +64,8 @@ cd ../..                       # back to the repo root
 source .venv/bin/activate      # re-activate the GR00T venv (conversion used its own)
 ```
 
+The conversion carries `meta/tasks.jsonl` over verbatim (task ids *and* natural-language descriptions), preserving the source task metadata on a converted dataset; `episodes.jsonl` uses the same task strings as `tasks.jsonl`, as LeRobot v2.1 expects.
+
 #### Deploy modality.json
 
 Before we can run training, we need GR00T-specific `meta/modality.json`. Deploy it into each task dataset (point it at the root that holds your task folders — run this **after** any v2.1 conversion, since conversion does not carry it over):
