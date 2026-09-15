@@ -50,22 +50,26 @@ cd $PATH_TO_BEHAVIOR_1K
   export LD_LIBRARY_PATH="$(python -c 'import site; print(site.getsitepackages()[0])')/nvidia/cuda_nvrtc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   ```
 
-- **`torch.compile` on B300 needs a CUDA 13 build of PyTorch.** The pinned torch 2.7.1+cu128 ships Triton 3.3.1, whose LLVM has no `sm_103` target (`LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.shfl.sync.bfly.i32`), and `sm_100a` binaries are architecture-locked (`no kernel image is available for execution on the device`), so `--compile-blocks` cannot run in the default environment. It does with `torch==2.10.0+cu130` (Triton 3.6; Linux aarch64 wheels exist for Python 3.10 and 3.12 at `https://download.pytorch.org/whl/cu130`, driver ≥ 580). Because the aarch64 `flash-attn` and `torchcodec` wheels in `scripts/deployment/dgpu/wheels/` are built against torch 2.7.1, such an environment is best made as a *second* venv rather than by editing `uv.lock`, following `scripts/deployment/spark/install_deps.sh`:
+- **`torch.compile` on B300 needs a CUDA 13 build of PyTorch — `scripts/deployment/b300/install_cu130_venv.sh` builds it.** The pinned torch 2.7.1+cu128 ships Triton 3.3.1, whose LLVM has no `sm_103` target (`LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.shfl.sync.bfly.i32`), and `sm_100a` binaries are architecture-locked (`no kernel image is available for execution on the device`), so `--compile-blocks` cannot run in the default environment. It does with `torch==2.10.0+cu130` (Triton 3.6). Because the aarch64 `flash-attn` and `torchcodec` wheels in `scripts/deployment/dgpu/wheels/` are built against torch 2.7.1, the script makes a *second* venv rather than editing `uv.lock` (the default `.venv` keeps working for eager training and serving):
+
+  1. `uv venv` (Python 3.10) + `torch==2.10.0` / `torchvision==0.25.0` from `https://download.pytorch.org/whl/cu130` (~5 min);
+  2. every other dependency at the versions of the default venv (`uv pip freeze` of `.venv`), `deepspeed==0.17.6` (pure-Python build) and the repo as an editable install;
+  3. `torchcodec` 0.10.0 from source against the host FFmpeg (~10 min). CMake gets a toolchain file that pins pybind11's config dir and the Python headers/library, because pybind11 uses the unversioned `FindPython` module and torchcodec the versioned one;
+  4. `flash-attn` 2.8.3 from source with the Spark recipe's CUTLASS pin, `FLASH_ATTN_CUDA_ARCHS=100` (`sm_100` SASS runs on `sm_103`) — **1–2 h** at `MAX_JOBS=16`, deliberately throttled so a shared box stays usable;
+  5. `flash-attn-4` (CuTe DSL, pure Python; used by `gr00t_fast` attention for padded batches — see [Training throughput knobs](#training-throughput-knobs)); `INSTALL_FA4=0` skips it;
+  6. smoke tests: flash-attn varlen, torchcodec decode of a generated clip, and a `torch.compile` of a small function on the GPU.
+
+  Prerequisites: the default venv (`uv sync --frozen --python 3.10`), a CUDA 13 toolkit (`CUDA_HOME`, default `/usr/local/cuda-13.0`, driver ≥ 580), CPython 3.10 headers, and FFmpeg development headers with `pkg-config`. Hosts without root and without `python3.10-dev` / `libav*-dev` can unpack those distro packages anywhere and point the script at them — that is how the environment behind this guide was built:
 
   ```
-  uv venv --python 3.10 /path/to/venv-cu130
-  uv pip install --python /path/to/venv-cu130/bin/python --index-url https://download.pytorch.org/whl/cu130 "torch==2.10.0" "torchvision==0.25.0"
-  # everything else at the versions of the working venv, then deepspeed==0.17.6 and the repo:
-  uv pip freeze --python .venv/bin/python | grep -v -E '^(torch|torchvision|triton|pytorch-triton|flash[-_]attn|torchcodec|nvidia-|deepspeed|-e )' > /tmp/base.txt
-  uv pip install --python /path/to/venv-cu130/bin/python -r /tmp/base.txt deepspeed==0.17.6
-  uv pip install --python /path/to/venv-cu130/bin/python --no-deps -e .
-  # flash-attn 2.8.3 from source (CUDA_HOME=/usr/local/cuda-13.0; sm_100 SASS runs on sm_103):
-  FLASH_ATTN_CUDA_ARCHS=100 MAX_JOBS=16 uv pip install --python /path/to/venv-cu130/bin/python --no-build-isolation "flash-attn==2.8.3"
-  # torchcodec 0.10.0 from source against the host FFmpeg (needs the libav*-dev headers + pkg-config):
-  I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 ENABLE_CUDA=0 uv pip install --python /path/to/venv-cu130/bin/python --no-build-isolation --no-deps git+https://github.com/pytorch/torchcodec.git@v0.10.0
+  VENV=/path/to/venv-cu130 \
+  PYTHON_INCLUDE_DIR=/path/to/libpython3.10-dev/usr/include/python3.10 \
+  PYTHON_LIBRARY=/path/to/libpython3.10-dev/usr/lib/aarch64-linux-gnu/libpython3.10.so \
+  FFMPEG_DEV_SYSROOT=/path/to/ffmpeg-dev \
+  bash scripts/deployment/b300/install_cu130_venv.sh
   ```
 
-  CUDA 13's NVRTC knows `sm_103`, so `activate_b300.sh` is not needed in that venv. On x86_64 with H100/A100 none of this applies: the default environment compiles fine.
+  The script is re-runnable (each phase leaves a marker in `$WORK`, default `$VENV-build`; delete one to redo that phase) and fixes the dangling `.so` symlinks that unpacked `-dev` packages leave behind. Afterwards `source /path/to/venv-cu130/bin/activate` and train with `--compile-blocks …`; `activate_b300.sh` is not needed there (CUDA 13's NVRTC knows `sm_103`). Everything else in this guide is unchanged; a checkpoint trained in this venv serves fine from the default one. On x86_64 with H100/A100 none of this applies: the default environment compiles fine.
 
 #### DeepSpeed on aarch64 hosts
 
