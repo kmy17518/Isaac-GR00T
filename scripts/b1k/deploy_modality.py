@@ -3,17 +3,18 @@
 
 All BEHAVIOR-1K R1Pro tasks share one modality layout (61-dim
 ``observation.state``, 23-dim ``action``, fixed camera keys), so a single
-template (``examples/b1k/r1pro.json``) is copied verbatim into each
-``<task>/meta/modality.json``. Before copying, each dataset's ``meta/info.json``
+template (``examples/b1k/r1pro.json``) is deployed into each
+``<task>/meta/modality.json``. Before writing, each dataset's ``meta/info.json``
 is validated against that layout, so any task that deviates from the expected
 format is reported loudly instead of being silently mis-sliced at train time.
 The tasks table each language annotation key resolves through (``meta/tasks.jsonl``,
 which carries both the natural-language ``task`` description and the snake_case
 ``task_name``) is checked the same way. The per-task partial download in the challenge
 docs does not fetch that sidecar (only the canonical ``meta/tasks.parquet``), so when a
-v3.0 dataset lacks it, the repo's verbatim copy (``examples/b1k/tasks.jsonl``) is
-installed after checking that it agrees with ``meta/tasks.parquet`` on every
-``task_index`` -> task name.
+v3.0 dataset lacks it, matching rows from ``examples/b1k/tasks.jsonl`` are installed
+after checking every canonical task ID/name. Converted v2 tables are enriched by
+matching IDs and existing text; their canonical ``task`` strings are preserved,
+and ``human.task_description`` reads the added ``task_description`` field.
 
 Usage:
     python scripts/b1k/deploy_modality.py <b1k_root> [--template PATH] [--tasks-file PATH] [--dry-run]
@@ -23,9 +24,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
-import shutil
 import sys
+import tempfile
 from typing import Any
 
 
@@ -56,7 +58,8 @@ def _load_canonical_v30_tasks(meta_dir: Path) -> dict[int, str]:
     df = pq.read_table(meta_dir / CANONICAL_V30_TASKS_FILE).to_pandas()
     if df.index.name == "task":  # LeRobot writes the task string as the (named) index
         df = df.reset_index()
-    return {int(row["task_index"]): str(row["task"]) for row in df.to_dict(orient="records")}
+    rows = _index_tasks(df.to_dict(orient="records"), str(meta_dir / CANONICAL_V30_TASKS_FILE))
+    return {index: row["task"] for index, row in rows.items()}
 
 
 def _sidecar_tables_needed(template: dict[str, Any]) -> set[str]:
@@ -68,75 +71,157 @@ def _sidecar_tables_needed(template: dict[str, Any]) -> set[str]:
     }
 
 
+def _index_tasks(rows: list[dict[str, Any]], label: str) -> dict[int, dict[str, Any]]:
+    indexed = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"{label}: task rows must be JSON objects")
+        index = row.get("task_index")
+        if type(index) is not int or index < 0:
+            raise ValueError(f"{label}: invalid task_index {index!r}")
+        if index in indexed:
+            raise ValueError(f"{label}: duplicate task_index {index}")
+        if not isinstance(row.get("task"), str) or not row["task"].strip():
+            raise ValueError(f"{label}: task_index {index} has no nonempty 'task' string")
+        indexed[index] = row
+    if not indexed:
+        raise ValueError(f"{label}: empty tasks table")
+    return indexed
+
+
 def _check_tasks_sidecar(
     sidecar_rows: list[dict[str, Any]], canonical: dict[int, str]
 ) -> list[str]:
-    """Errors if ``sidecar_rows`` disagree with the canonical table on task_index -> task_name.
-
-    The canonical v3.0 task string of the BEHAVIOR demos is the snake_case task
-    name, so the sidecar's ``task_name`` must match it index by index and cover the
-    same indices; otherwise the sidecar is from a different dataset revision.
-    """
-    errors: list[str] = []
-    by_index: dict[int, dict[str, Any]] = {}
-    for row in sidecar_rows:
-        if "task_index" not in row:
-            errors.append(f"row without task_index: {row}")
-            continue
-        by_index[int(row["task_index"])] = row
-    if set(by_index) != set(canonical):
-        errors.append(
-            f"task indices differ: sidecar has {len(by_index)}, meta/{CANONICAL_V30_TASKS_FILE} "
-            f"has {len(canonical)} (missing {sorted(set(canonical) - set(by_index))[:5]}, "
-            f"extra {sorted(set(by_index) - set(canonical))[:5]})"
-        )
-    for task_index, row in sorted(by_index.items()):
-        expected = canonical.get(task_index)
-        if expected is not None and row.get("task_name") != expected:
+    """Require ID/name agreement for every canonical row; allow a reference superset."""
+    try:
+        by_index = _index_tasks(sidecar_rows, "sidecar")
+    except ValueError as exc:
+        return [str(exc)]
+    errors = []
+    missing = set(canonical) - set(by_index)
+    if missing:
+        errors.append(f"task indices differ: sidecar missing {sorted(missing)}")
+    for index, expected in canonical.items():
+        row = by_index.get(index)
+        if row is not None and row.get("task_name") != expected:
             errors.append(
-                f"task_index {task_index}: sidecar task_name {row.get('task_name')!r} != "
+                f"task_index {index}: sidecar task_name {row.get('task_name')!r} != "
                 f"meta/{CANONICAL_V30_TASKS_FILE} task {expected!r}"
             )
     return errors
 
 
+def _atomic_write(path: Path, payload: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def ensure_tasks_sidecar(
     dataset: Path, template: dict[str, Any], tasks_file: Path, dry_run: bool
 ) -> tuple[str, list[str]]:
-    """Install ``meta/tasks.jsonl`` from ``tasks_file`` when a v3.0 dataset lacks it.
+    """Install a missing v3 sidecar or enrich a converted table by matching IDs and text.
 
-    Returns ``(status, errors)`` with status one of ``"present"`` (nothing to do),
-    ``"installed"`` / ``"planned"`` (copied, or would be under ``--dry-run``), or
-    ``"skipped"`` (template does not need a jsonl sidecar, or dataset is not v3.0 --
-    the loader then reports a missing table itself). ``errors`` is non-empty when
-    the repo copy does not match the dataset's canonical tasks table.
+    Converted v2 task strings remain canonical for episodes.jsonl. Their human-readable
+    descriptions are added separately and selected by the deployed modality metadata.
     """
-    meta_dir = dataset / "meta"
     needed = _sidecar_tables_needed(template)
     if not needed:
         return "skipped", []
     if len(needed) > 1:
         return "skipped", [f"template references several jsonl tasks tables: {sorted(needed)}"]
-    sidecar = meta_dir / next(iter(needed))
-    if sidecar.is_file():
-        return "present", []
-    if not (meta_dir / CANONICAL_V30_TASKS_FILE).is_file():
-        return (
-            "skipped",
-            [],
-        )  # v2.x layout: tasks.jsonl *is* the canonical table; nothing to derive from
-    if not tasks_file.is_file():
-        return "skipped", [f"meta/{sidecar.name} missing and no sidecar source at {tasks_file}"]
+    filename = next(iter(needed))
+    if Path(filename).name != filename:
+        return "skipped", [f"tasks table must be a filename within meta/: {filename}"]
+    meta_dir = dataset / "meta"
+    sidecar = meta_dir / filename
+    try:
+        canonical = (
+            _load_canonical_v30_tasks(meta_dir)
+            if (meta_dir / CANONICAL_V30_TASKS_FILE).is_file()
+            else None
+        )
+        rows = _load_jsonl(sidecar) if sidecar.is_file() else None
+        existing = _index_tasks(rows, str(sidecar)) if rows is not None else None
+        if existing is not None and canonical is not None and not set(canonical) <= set(existing):
+            raise ValueError("existing sidecar task indices differ from meta/tasks.parquet")
+        if existing is not None and all(
+            isinstance(row.get("task_name"), str) and row["task_name"].strip() for row in rows
+        ):
+            errors = _check_tasks_sidecar(rows, canonical) if canonical is not None else []
+            return "present", errors
+        if existing is None and canonical is None:
+            return "skipped", []
+        if not tasks_file.is_file():
+            raise ValueError(f"no canonical sidecar source at {tasks_file}; supply --tasks-file")
+        reference = _index_tasks(_load_jsonl(tasks_file), str(tasks_file))
+        if any(
+            not isinstance(row.get("task_name"), str) or not row["task_name"].strip()
+            for row in reference.values()
+        ):
+            raise ValueError(f"{tasks_file}: reference rows must have nonempty task_name strings")
+        if canonical is not None:
+            errors = _check_tasks_sidecar(list(reference.values()), canonical)
+            if errors:
+                return "skipped", errors
+        if existing is None:
+            rows = [reference[index] for index in canonical]
+            status = "installed"
+        else:
+            enriched = []
+            for index, row in existing.items():
+                match = reference.get(index)
+                if (
+                    match is None
+                    or row["task"] not in (match["task_name"], match["task"])
+                    or row.get("task_name") not in (None, "", match["task_name"])
+                    or row.get("task_description") not in (None, "", match["task"])
+                ):
+                    raise ValueError(
+                        f"task_index {index}: existing ID/text does not match {tasks_file}"
+                    )
+                enriched.append(
+                    {**row, "task_name": match["task_name"], "task_description": match["task"]}
+                )
+            rows = enriched
+            status = "enriched"
+        for key, annotation in template["annotation"].items():
+            if annotation.get("tasks_file") == filename:
+                field = annotation.get("task_field", "task")
+                if any(not row.get(field) for row in rows):
+                    raise ValueError(f"annotation '{key}' requires missing field '{field}'")
+        if dry_run:
+            return "planned", []
+        payload = "".join(json.dumps(row) + "\n" for row in rows).encode()
+        _atomic_write(sidecar, payload)
+        return status, []
+    except (ValueError, OSError) as exc:
+        return "skipped", [f"cannot prepare meta/{filename}: {exc}"]
 
-    errors = _check_tasks_sidecar(_load_jsonl(tasks_file), _load_canonical_v30_tasks(meta_dir))
-    if errors:
-        return "skipped", [
-            f"cannot install meta/{sidecar.name} from {tasks_file}: {e}" for e in errors
-        ]
-    if dry_run:
-        return "planned", []
-    shutil.copyfile(tasks_file, sidecar)
-    return "installed", []
+
+def _dataset_template(dataset: Path, template: dict[str, Any]) -> dict[str, Any]:
+    template = json.loads(json.dumps(template))
+    description = template["annotation"].get("human.task_description", {})
+    filename = description.get("tasks_file")
+    if (
+        description.get("task_field", "task") == "task"
+        and filename
+        and (dataset / "meta" / filename).is_file()
+    ):
+        rows = _load_jsonl(dataset / "meta" / filename)
+        if (
+            rows
+            and all(row.get("task_description") for row in rows)
+            and any(row.get("task") == row.get("task_name") for row in rows)
+        ):
+            description["task_field"] = "task_description"
+    return template
 
 
 def _validate_template(template: dict[str, Any]) -> None:
@@ -262,9 +347,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_TASKS_FILE,
         help=(
-            "tasks.jsonl to install into meta/ when a v3.0 dataset lacks the sidecar the "
-            f"template's annotation keys read, e.g. a per-task partial download (default: "
-            f"{DEFAULT_TASKS_FILE}). Only installed if it matches meta/tasks.parquet."
+            "Canonical tasks.jsonl used to install missing v3 sidecars or enrich converted "
+            f"tables after ID/text matching (default: {DEFAULT_TASKS_FILE})."
         ),
     )
     parser.add_argument(
@@ -284,7 +368,6 @@ def main() -> int:
         return 2
     template = _load_json(template_path)
     _validate_template(template)
-    template_bytes = template_path.read_bytes()
     tasks_file = args.tasks_file.expanduser().resolve()
 
     root = args.root.expanduser().resolve()
@@ -296,22 +379,30 @@ def main() -> int:
     written = unchanged = failed = 0
     for dataset in datasets:
         dst = dataset / "meta" / "modality.json"
-        # A partial download has no meta/tasks.jsonl; install the repo copy first so
-        # the tasks-table validation below sees it (dry-run only plans the install).
-        sidecar_status, errors = ensure_tasks_sidecar(dataset, template, tasks_file, args.dry_run)
-        if sidecar_status == "installed":
-            print(f"[write] {dataset}/meta/tasks.jsonl (from {tasks_file}, matches tasks.parquet)")
+        info = _load_json(dataset / "meta" / "info.json")
+        errors = _validate_dataset(info, template)
+        sidecar_status = "skipped"
+        if not errors:
+            sidecar_status, errors = ensure_tasks_sidecar(
+                dataset, template, tasks_file, args.dry_run
+            )
+        if sidecar_status in ("installed", "enriched"):
+            print(f"[write] {dataset}/meta/tasks.jsonl ({sidecar_status}, matched {tasks_file})")
         elif sidecar_status == "planned":
             written += 1
             print(f"[plan] {dataset}/meta/tasks.jsonl (would install from {tasks_file})")
         # Under --dry-run the planned sidecar is not on disk yet, so skip the
         # tasks-table check (it would only re-report the missing file).
-        info = _load_json(dataset / "meta" / "info.json")
-        errors.extend(
-            _validate_dataset(
-                info, template, meta_dir=None if sidecar_status == "planned" else dataset / "meta"
+        deployed_template = _dataset_template(dataset, template) if not errors else template
+        if not errors:
+            errors.extend(
+                _validate_dataset(
+                    info,
+                    deployed_template,
+                    meta_dir=None if sidecar_status == "planned" else dataset / "meta",
+                )
             )
-        )
+        template_bytes = (json.dumps(deployed_template, indent=4) + "\n").encode()
         if errors:
             failed += 1
             print(f"[FAIL] {dataset}")
@@ -326,7 +417,7 @@ def main() -> int:
             written += 1
             print(f"[plan] {dataset} (would write modality.json)")
         else:
-            shutil.copyfile(template_path, dst)
+            _atomic_write(dst, template_bytes)
             written += 1
             print(f"[write] {dataset}")
 

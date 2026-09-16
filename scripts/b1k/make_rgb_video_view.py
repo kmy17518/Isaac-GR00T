@@ -50,11 +50,13 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 import albumentations as A
@@ -85,9 +87,58 @@ def transcode_file(
     cabac: bool = False,
     verify_samples: int = 24,
     seed: int = 0,
+    *,
+    source_root: str,
+    view_root: str,
 ) -> dict:
-    """Decode ``src`` with torchcodec (the training decoder), apply the pipeline head, encode
-    losslessly to ``dst``; then verify sampled frames bitwise. Returns a manifest entry."""
+    """Encode and verify inside an independent view, never through an output symlink."""
+    source, view = _independent_roots(Path(source_root), Path(view_root))
+    src_path, dst_path = Path(src).resolve(strict=True), Path(dst)
+    if not src_path.is_relative_to(source) or src_path.is_relative_to(view):
+        raise ValueError(f"Source video escapes source-root: {src}")
+    _check_output(dst_path, view, source)
+    if dst_path.exists() and dst_path.samefile(src_path):
+        raise ValueError(f"Source and destination are aliases: {src}, {dst}")
+    _check_output(Path(dst + ".tmp.mp4"), view, source)
+    fd, tmp = tempfile.mkstemp(prefix=f".{dst_path.stem}.", suffix=".tmp.mp4", dir=dst_path.parent)
+    os.close(fd)
+    try:
+        entry = _encode_video(
+            src,
+            tmp,
+            shortest_edge,
+            fps,
+            block,
+            decode_threads,
+            encode_threads,
+            preset,
+            gop,
+            cabac,
+            verify_samples,
+            seed,
+        )
+        _check_output(dst_path, view, source)
+        _check_output(Path(tmp), view, source)
+        os.replace(tmp, dst)
+        return entry
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _encode_video(
+    src: str,
+    tmp: str,
+    shortest_edge: int,
+    fps: float,
+    block: int,
+    decode_threads: int,
+    encode_threads: int,
+    preset: str,
+    gop: int,
+    cabac: bool,
+    verify_samples: int,
+    seed: int,
+) -> dict:
     from torchcodec.decoders import VideoDecoder
 
     head = pipeline_head(shortest_edge)
@@ -97,7 +148,6 @@ def transcode_file(
         raise RuntimeError(f"{src}: unknown frame count")
     first = head(image=dec.get_frames_at(indices=[0]).data[0].numpy())["image"]
     h, w = first.shape[:2]
-    tmp = dst + ".tmp.mp4"
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -151,6 +201,7 @@ def transcode_file(
             raise RuntimeError(f"ffmpeg failed on {src}")
     except BaseException:
         proc.kill()
+        proc.wait()
         Path(tmp).unlink(missing_ok=True)
         raise
     t_enc = time.time() - t0
@@ -159,7 +210,7 @@ def transcode_file(
     new = VideoDecoder(tmp, device="cpu", dimension_order="NHWC", num_ffmpeg_threads=decode_threads)
     if new.metadata.num_frames != n:
         Path(tmp).unlink(missing_ok=True)
-        raise RuntimeError(f"{dst}: frame count {new.metadata.num_frames} != source {n}")
+        raise RuntimeError(f"{tmp}: frame count {new.metadata.num_frames} != source {n}")
     rng = np.random.default_rng(seed)
     sample = sorted({0, n - 1, *rng.integers(0, n, size=verify_samples).tolist()})
     got = new.get_frames_at(indices=sample).data.numpy()
@@ -168,13 +219,12 @@ def transcode_file(
     )
     if got.shape != want.shape or not np.array_equal(got, want):
         Path(tmp).unlink(missing_ok=True)
-        raise RuntimeError(f"{dst}: decoded frames differ from the source pipeline head")
-    os.replace(tmp, dst)
+        raise RuntimeError(f"{tmp}: decoded frames differ from the source pipeline head")
     return {
         "source": src,
         "frames": n,
         "size": [h, w],
-        "bytes": os.path.getsize(dst),
+        "bytes": os.path.getsize(tmp),
         "seconds": round(t_enc, 1),
         "verified_frames": sample,
     }
@@ -215,11 +265,126 @@ def rgb_video_keys(info: dict, modality_json: str | None) -> list[str]:
     )
 
 
-def link(target: Path, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink() or path.exists():
-        return
-    path.symlink_to(target.resolve())
+MANIFEST_NAME = "RGB_VIEW_MANIFEST.json"
+
+
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _independent_roots(source: Path, view: Path) -> tuple[Path, Path]:
+    if view.is_symlink():
+        raise ValueError("view-root must not be a symlink; use an independent directory")
+    source, view = source.resolve(strict=True), view.resolve()
+    if source.is_relative_to(view) or view.is_relative_to(source):
+        raise ValueError("source-root and view-root must be independent, non-nested directories")
+    return source, view
+
+
+def _relative_video_path(rel: str) -> Path:
+    path = Path(rel)
+    if path.is_absolute() or ".." in path.parts or len(path.parts) < 2 or path.parts[0] != "videos":
+        raise ValueError(f"Video path must stay under videos/: {rel}")
+    return path
+
+
+def _source_fingerprint(source: Path, view: Path, rel: str) -> dict:
+    path = (source / _relative_video_path(rel)).resolve(strict=True)
+    if not path.is_relative_to(source) or path.is_relative_to(view) or not path.is_file():
+        raise ValueError(f"Source video escapes source-root or overlaps view-root: {path}")
+    return {"path": str(path), "sha256": _digest(path)}
+
+
+def _check_output(path: Path, view: Path, source: Path) -> None:
+    resolved = path.resolve()
+    if (
+        not path.is_relative_to(view)
+        or not resolved.is_relative_to(view)
+        or resolved.is_relative_to(source)
+        or resolved == view
+        or any(
+            parent.is_symlink() for parent in (path, *path.parents) if parent.is_relative_to(view)
+        )
+    ):
+        raise ValueError(f"Output must stay inside independent view-root without symlinks: {path}")
+
+
+def _mirror_selected(source: Path, view: Path, selected: set[Path]) -> None:
+    """Materialize only selected ancestors; leave every untouched sibling linked."""
+    ancestors = {parent for rel in selected for parent in rel.parents}
+
+    def visit(src: Path, dst: Path, rel: Path) -> None:
+        if rel in ancestors:
+            if dst.is_symlink():
+                if dst.resolve() != src.resolve():
+                    raise ValueError(f"Unexpected directory symlink in view: {dst}")
+                dst.unlink()
+            _check_output(dst, view, source)
+            dst.mkdir(exist_ok=True)
+            for child in sorted(src.iterdir()):
+                visit(child, dst / child.name, rel / child.name)
+        elif rel in selected:
+            if dst.is_symlink():
+                if dst.resolve() != src.resolve():
+                    raise ValueError(f"Unexpected video symlink in view: {dst}")
+                dst.unlink()
+            _check_output(dst, view, source)
+            if dst.exists() and dst.samefile(src):
+                raise ValueError(f"Source and destination are aliases: {src}, {dst}")
+        elif not dst.exists() and not dst.is_symlink():
+            dst.symlink_to(src.resolve())
+
+    for entry in sorted(source.iterdir()):
+        if entry.name != MANIFEST_NAME:
+            visit(entry, view / entry.name, Path(entry.name))
+
+
+def _write_manifest(path: Path, manifest: dict, view: Path, source: Path) -> None:
+    _check_output(path, view, source)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=view)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _configuration(args: argparse.Namespace, source: Path, fps: float) -> dict:
+    from gr00t.model.gr00t_n1d7 import image_augmentations
+    import torch
+    import torchcodec
+
+    return {
+        "format_version": 1,
+        "source_root": str(source),
+        "shortest_edge": args.shortest_edge,
+        "fps": fps,
+        "gop": args.gop,
+        "cabac": args.cabac,
+        "preset": args.preset,
+        "decode_threads": args.decode_threads,
+        "encode_threads": args.encode_threads,
+        "verify_samples": args.verify_samples,
+        "codec": "libx264rgb -qp 0 (lossless RGB 4:4:4)",
+        "pipeline_head": "LetterBoxPad + SmallestMaxSize(shortest_edge, INTER_AREA)",
+        "versions": {
+            "albumentations": A.__version__,
+            "opencv": cv2.__version__,
+            "numpy": np.__version__,
+            "torch": torch.__version__,
+            "torchcodec": torchcodec.__version__,
+            "ffmpeg": subprocess.check_output(["ffmpeg", "-version"], text=True),
+            "script_sha256": _digest(Path(__file__)),
+            "pipeline_sha256": _digest(Path(image_augmentations.__file__)),
+        },
+    }
 
 
 def main() -> int:
@@ -266,80 +431,74 @@ def main() -> int:
     p.add_argument("--verify-samples", type=int, default=24)
     args = p.parse_args()
 
-    source, view = Path(args.source_root), Path(args.view_root)
+    source, view = _independent_roots(Path(args.source_root), Path(args.view_root))
     info = json.loads((source / "meta" / "info.json").read_text())
     fps = float(info.get("fps", 30))
     keys = args.video_keys or rgb_video_keys(info, args.modality_json)
     files, n_episodes = selected_video_files(source, info, keys, args.task_names)
+    selected = {_relative_video_path(video_rel_path(info, *file)) for file in files}
     print(
         f"{n_episodes} episodes, {len(keys)} video keys {keys}, {len(files)} files to transcode -> {view}"
     )
 
-    view.mkdir(parents=True, exist_ok=True)
-    # Everything except videos/ is shared with the source (data, meta, README, ...).
-    for entry in source.iterdir():
-        if entry.name != "videos":
-            link(entry, view / entry.name)
-    # videos/: symlink whole key dirs we do not touch, whole chunk dirs we do not touch, and the
-    # untouched files inside touched chunks.
-    selected = {(k, c) for k, c, _ in files}
-    for key_dir in sorted((source / "videos").iterdir()):
-        key = key_dir.name
-        if key not in keys or not any(k == key for k, _ in selected):
-            link(key_dir, view / "videos" / key)
-            continue
-        for chunk_dir in sorted(key_dir.iterdir()):
-            chunk = (
-                int(chunk_dir.name.split("-")[-1]) if chunk_dir.name.startswith("chunk-") else None
-            )
-            if chunk is None or (key, chunk) not in selected:
-                link(chunk_dir, view / "videos" / key / chunk_dir.name)
-                continue
-            wanted = {
-                video_rel_path(info, key, chunk, f) for k, c, f in files if k == key and c == chunk
-            }
-            for f in sorted(chunk_dir.iterdir()):
-                rel = f"videos/{key}/{chunk_dir.name}/{f.name}"
-                if rel not in wanted:
-                    link(f, view / rel)
-
-    manifest_path = view / "RGB_VIEW_MANIFEST.json"
+    config = _configuration(args, source, fps)
+    config_digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    manifest_path = view / MANIFEST_NAME
+    _check_output(manifest_path, view, source)
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    manifest.update(
-        {
-            "source_root": str(source.resolve()),
-            "shortest_edge": args.shortest_edge,
-            "codec": f"libx264rgb -qp 0 -g {args.gop} {'cabac' if args.cabac else 'cavlc'} (lossless RGB 4:4:4)",
-            "pipeline_head": "LetterBoxPad + SmallestMaxSize(shortest_edge, INTER_AREA)",
-            "versions": {
-                "albumentations": A.__version__,
-                "opencv": cv2.__version__,
-                "torchcodec": __import__("torchcodec").__version__,
-            },
-            "video_keys": keys,
-            "task_names": args.task_names,
-        }
-    )
+    if manifest and manifest.get("configuration") != config:
+        raise ValueError(
+            "Incompatible RGB view source/configuration/version; use a new --view-root"
+        )
+    if not manifest and view.exists() and any(view.iterdir()):
+        raise ValueError("Nonempty view has no compatible manifest; use a new --view-root")
     manifest.setdefault("files", {})
-
-    todo = []
-    for key, chunk, file in files:
-        rel = video_rel_path(info, key, chunk, file)
-        dst = view / rel
+    manifest.setdefault("sources", {})
+    fingerprints = {
+        rel: _source_fingerprint(source, view, rel)
+        for rel in sorted(set(manifest["sources"]) | {str(rel) for rel in selected})
+    }
+    # Pending files also retain provenance across interrupted runs.
+    for rel, fingerprint in manifest["sources"].items():
+        if fingerprint != fingerprints[rel]:
+            raise ValueError(f"Source changed for {rel}; use a new --view-root")
+    for rel, entry in manifest["files"].items():
         if (
-            rel in manifest["files"]
-            and dst.exists()
-            and dst.stat().st_size == manifest["files"][rel]["bytes"]
+            entry.get("source_fingerprint") != fingerprints[rel]
+            or entry.get("configuration_sha256") != config_digest
         ):
+            raise ValueError(f"Source/configuration changed for {rel}; use a new --view-root")
+    manifest.update(
+        configuration=config,
+        source_root=str(source),
+        shortest_edge=args.shortest_edge,
+        video_keys=keys,
+        task_names=args.task_names,
+        selected_files=sorted(str(rel) for rel in selected),
+        sources=fingerprints,
+    )
+
+    view.mkdir(parents=True, exist_ok=True)
+    _mirror_selected(source, view, {Path(rel) for rel in fingerprints})
+    todo = []
+    for rel in sorted(fingerprints):
+        dst = view / rel
+        _check_output(dst, view, source)
+        stale_tmp = Path(str(dst) + ".tmp.mp4")
+        _check_output(stale_tmp, view, source)
+        stale_tmp.unlink(missing_ok=True)
+        entry = manifest["files"].get(rel, {})
+        if dst.is_file() and entry.get("output_sha256") == _digest(dst):
             continue
+        manifest["files"].pop(rel, None)
         todo.append((rel, str(source / rel), str(dst)))
-    print(f"{len(files) - len(todo)} already done, {len(todo)} to do")
+    print(f"{len(fingerprints) - len(todo)} already done, {len(todo)} to do")
+    _write_manifest(manifest_path, manifest, view, source)
 
     failed = 0
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
         futures = {}
         for rel, src, dst in todo:
-            Path(dst).parent.mkdir(parents=True, exist_ok=True)
             futures[
                 ex.submit(
                     transcode_file,
@@ -350,19 +509,30 @@ def main() -> int:
                     decode_threads=args.decode_threads,
                     encode_threads=args.encode_threads,
                     preset=args.preset,
+                    gop=args.gop,
+                    cabac=args.cabac,
                     verify_samples=args.verify_samples,
+                    source_root=str(source),
+                    view_root=str(view),
                 )
             ] = rel
         for fut in as_completed(futures):
             rel = futures[fut]
             try:
                 entry = fut.result()
+                if _source_fingerprint(source, view, rel) != fingerprints[rel]:
+                    raise RuntimeError(f"Source changed during encoding: {rel}")
+                entry.update(
+                    source_fingerprint=fingerprints[rel],
+                    configuration_sha256=config_digest,
+                    output_sha256=_digest(view / rel),
+                )
             except Exception as e:  # noqa: BLE001
                 failed += 1
                 print(f"FAILED {rel}: {e}", file=sys.stderr)
                 continue
             manifest["files"][rel] = entry
-            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+            _write_manifest(manifest_path, manifest, view, source)
             print(
                 f"ok {rel}: {entry['frames']} frames, {entry['bytes'] / 1e6:.0f} MB, {entry['seconds']}s, "
                 f"verified {len(entry['verified_frames'])} frames bitwise"

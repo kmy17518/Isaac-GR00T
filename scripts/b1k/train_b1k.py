@@ -55,8 +55,9 @@ class B1KFinetuneConfig(FinetuneConfig):
     compile_blocks: str | None = None
     """``torch.compile`` the repeated transformer blocks: comma-separated subset of
     ``vision,llm,dit,vlsa`` (see ``gr00t.model.modules.compile_blocks``). Fuses the elementwise
-    work around the GEMMs; not bit-identical to eager (bf16-noise level). Training-only setting.
-    Requires an Inductor/Triton that supports the GPU (B300: torch >= 2.9 cu130)."""
+    work around the GEMMs; training-only and not bit-identical to eager. Multi-GPU DeepSpeed
+    permits only ``dit`` or ``vlsa`` individually; combining them has a gradient corruption
+    regression. Requires a compatible Inductor/Triton (B300: torch >= 2.9 cu130)."""
 
     compile_mode: str | None = None
     """``torch.compile`` mode for ``--compile-blocks`` (e.g. ``max-autotune-no-cudagraphs``)."""

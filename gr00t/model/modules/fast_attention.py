@@ -29,9 +29,8 @@ GQA decoder layers, 256-patch image segments) and is traceable by Inductor. This
 * **padded batches** (multi-task prompts of different lengths): unpad + FlashAttention varlen,
   FlashAttention-4 (``flash_attn.cute``, CuTe DSL) when installed, else FlashAttention-2.
 
-Use it with ``Qwen3Backbone(attn_implementation="gr00t_fast")``. ``set_packed_segment_length`` must
-be called once per forward with the tokens-per-image (``Qwen3Backbone.forward`` does), so the
-uniform-segment test needs no device sync inside the compiled blocks.
+Use it with ``Qwen3Backbone(attn_implementation="gr00t_fast")``. The patched vision forward
+passes per-call segment metadata through each block's checkpoint arguments.
 """
 
 from __future__ import annotations
@@ -53,14 +52,6 @@ _SDP_BACKENDS = {
     "efficient": torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
     "math": torch.nn.attention.SDPBackend.MATH,
 }
-
-# Tokens per packed image segment for the current forward (None = unknown / not uniform).
-_packed_segment_length: Optional[int] = None
-
-
-def set_packed_segment_length(length: Optional[int]) -> None:
-    global _packed_segment_length
-    _packed_segment_length = length
 
 
 def uniform_segment_length(grid_thw: torch.Tensor) -> Optional[int]:
@@ -197,7 +188,7 @@ def gr00t_fast_attention_forward(
         cu_k = kwargs.get("cu_seq_lens_k", cu_q)
         num_heads, total, head_dim = query.shape[1], query.shape[2], query.shape[3]
         num_segments = cu_q.numel() - 1
-        seg = _packed_segment_length
+        seg = kwargs.get("packed_segment_length")
         if seg is not None and num_segments * seg == total and dropout == 0.0:
 
             def to_batch(x):  # (1, h, total, d) -> (n, h, seg, d)
@@ -304,17 +295,25 @@ def _vision_attention_forward(
         max_length_q=None,  # only needed by the ragged fallback, which derives it lazily
         max_length_k=None,
         is_causal=False,
+        packed_segment_length=kwargs.get("packed_segment_length"),
     )
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     return self.proj(attn_output)
 
 
+def _vision_forward_with_segments(self, hidden_states, grid_thw, **kwargs):
+    # Checkpoint recomputation must retain this forward's metadata, not the next batch's.
+    kwargs["packed_segment_length"] = uniform_segment_length(grid_thw)
+    return self._gr00t_original_forward(hidden_states, grid_thw, **kwargs)
+
+
 def patch_qwen3_vl_vision_attention(vision_model: torch.nn.Module) -> int:
-    """Bind the packed forward to every vision attention module of ``vision_model``."""
+    """Pass immutable segmentation through the vision blocks and their checkpoints."""
     import types
 
-    n = 0
+    if not hasattr(vision_model, "_gr00t_original_forward"):
+        vision_model._gr00t_original_forward = vision_model.forward
+        vision_model.forward = types.MethodType(_vision_forward_with_segments, vision_model)
     for blk in vision_model.blocks:
         blk.attn.forward = types.MethodType(_vision_attention_forward, blk.attn)
-        n += 1
-    return n
+    return len(vision_model.blocks)

@@ -181,3 +181,64 @@ def test_sidecar_row_without_task_is_rejected(converter, tmp_path):
     root = _make_v30_root(tmp_path / "src", with_sidecar=True, sidecar_rows=rows)
     with pytest.raises(ValueError, match="must have 'task_index' and 'task'"):
         converter.convert_tasks(root, tmp_path / "dst")
+
+
+@pytest.mark.parametrize("with_sidecar", [False, True])
+def test_partial_conversion_then_deploy_resolves_both_prompts(
+    converter, tmp_path, monkeypatch, with_sidecar
+):
+    from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+    from scripts.b1k import deploy_modality
+
+    root = _make_v30_root(tmp_path / "dataset", with_sidecar=with_sidecar)
+    template = json.loads((REPO_ROOT / "examples/b1k/r1pro.json").read_text())
+    features = {
+        "observation.state": {"dtype": "float32", "shape": [61]},
+        "action": {"dtype": "float32", "shape": [23]},
+        "task_index": {"dtype": "int64", "shape": [1]},
+        **{meta["original_key"]: {"dtype": "video"} for meta in template["video"].values()},
+    }
+    (root / "meta/info.json").write_text(
+        json.dumps({"codebase_version": "v3.0", "features": features})
+    )
+    records = _episode_records()[:1]
+    metadata = root / "meta/episodes/chunk-000/file-000.parquet"
+    metadata.parent.mkdir(parents=True)
+    pd.DataFrame(records).to_parquet(metadata)
+    data = root / "data/chunk-000/file-000.parquet"
+    data.parent.mkdir(parents=True)
+    pd.DataFrame({"task_index": [0] * 10, "frame_index": range(10)}).to_parquet(data)
+
+    def write_info(info, destination):
+        (destination / "meta").mkdir(parents=True, exist_ok=True)
+        (destination / "meta/info.json").write_text(json.dumps(info))
+
+    monkeypatch.setattr(converter, "write_info", write_info)
+    monkeypatch.setattr(
+        converter, "snapshot_download", lambda *a, **kw: pytest.fail("network download")
+    )
+    converter.convert_dataset("dataset", root=tmp_path)
+    tasks_before = (root / "meta/tasks.jsonl").read_bytes()
+    episodes_before = (root / "meta/episodes.jsonl").read_bytes()
+    source_before = (tmp_path / "dataset_v3.0/meta/tasks.parquet").read_bytes()
+    reference = tmp_path / "canonical.jsonl"
+    reference.write_text("".join(json.dumps(row) + "\n" for row in TASKS))
+    monkeypatch.setattr(sys, "argv", ["deploy", str(root), "--tasks-file", str(reference)])
+    assert deploy_modality.main() == 0
+    assert deploy_modality.main() == 0
+    assert (root / "meta/episodes.jsonl").read_bytes() == episodes_before
+    assert (tmp_path / "dataset_v3.0/meta/tasks.parquet").read_bytes() == source_before
+    if with_sidecar:
+        assert (root / "meta/tasks.jsonl").read_bytes() == tasks_before
+    tasks = _read_jsonl(root / "meta/tasks.jsonl")
+    episodes = _read_jsonl(root / "meta/episodes.jsonl")
+    assert episodes[0]["tasks"] == [tasks[0]["task"]]
+    assert len(tasks) == 2 and len(episodes) == 1
+    loader = LeRobotEpisodeLoader.__new__(LeRobotEpisodeLoader)
+    loader.dataset_path = str(root)
+    loader.tasks_filename = "tasks.jsonl"
+    loader._tasks_tables = {}
+    loader._annotation_text_maps = {}
+    loader.modality_meta = json.loads((root / "meta/modality.json").read_text())
+    assert loader._get_annotation_text_map("human.task_description")[0] == TASKS[0]["task"]
+    assert loader._get_annotation_text_map("human.task_name")[0] == TASKS[0]["task_name"]

@@ -151,10 +151,9 @@ def _qwen3_vit_and_scatter(self, vl_input):
     These ops stay in PyTorch because they involve dynamic Python logic
     (get_rope_index, masked_scatter, get_placeholder_mask).
     """
+    pixel_values = self.normalize_pixel_values(vl_input["pixel_values"])
     qwen_model = self.model  # Qwen3VLForConditionalGeneration
     inner_model = qwen_model.model  # Qwen3VLModel
-
-    pixel_values = vl_input["pixel_values"]
     grid_thw = vl_input["image_grid_thw"]
     engine_dtype = torch.bfloat16
 
@@ -280,12 +279,12 @@ def qwen3_backbone_llm_trt_forward(self, vl_input):
     keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
     vl_input = {k: vl_input[k] for k in keys_to_use}
 
+    pixel_values = self.normalize_pixel_values(vl_input["pixel_values"])
     # Run PyTorch ViT + scatter + rope (original backbone logic up to LLM)
     qwen_model = self.model
     inner_model = qwen_model.model
 
     # ViT forward (PyTorch — kept for accuracy)
-    pixel_values = vl_input["pixel_values"]
     grid_thw = vl_input["image_grid_thw"]
     image_embeds_split, deepstack_image_embeds = inner_model.get_image_features(
         pixel_values, grid_thw

@@ -51,8 +51,8 @@ class PixelPatchNormalizer:
         temporal_patch_size: int,
     ):
         # Exactly transformers' _fuse_mean_std_and_rescale_factor (fp32 tensor * python float).
-        mean = torch.tensor(image_mean) * (1.0 / rescale_factor)
-        std = torch.tensor(image_std) * (1.0 / rescale_factor)
+        mean = torch.tensor(image_mean, dtype=torch.float32) * (1.0 / rescale_factor)
+        std = torch.tensor(image_std, dtype=torch.float32) * (1.0 / rescale_factor)
         per_channel = temporal_patch_size * patch_size * patch_size
         # Flattened patch order is (channel, temporal, patch_h, patch_w): channel-major.
         self.mean = mean.repeat_interleave(per_channel)
@@ -243,30 +243,24 @@ class Qwen3Backbone(torch.nn.Module):
     def _capture_last_layer(self, module, inputs, output) -> None:
         self._last_layer_output = output[0] if isinstance(output, tuple) else output
 
+    def normalize_pixel_values(self, pixel_values):
+        """Normalize raw patches before eager or TensorRT vision execution."""
+        if isinstance(pixel_values, (list, tuple)):
+            pixel_values = torch.cat(pixel_values, dim=0)
+        if pixel_values.dtype != torch.uint8:
+            return pixel_values
+        if self.pixel_patch_normalizer is None:
+            raise RuntimeError(
+                "uint8 pixel_values need Qwen3Backbone.pixel_patch_normalizer (set by Gr00tN1d7)"
+            )
+        return self.pixel_patch_normalizer(pixel_values)
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
-        # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-        if vl_input["pixel_values"].dtype == torch.uint8:
-            # Collator emitted unnormalized patches (pixel_values_dtype="uint8"); do the
-            # processor's fp32 rescale+normalize here instead, bit-identically.
-            if self.pixel_patch_normalizer is None:
-                raise RuntimeError(
-                    "uint8 pixel_values need Qwen3Backbone.pixel_patch_normalizer (set by Gr00tN1d7)"
-                )
-            vl_input["pixel_values"] = self.pixel_patch_normalizer(vl_input["pixel_values"])
-        if self.attn_implementation == "gr00t_fast":
-            from gr00t.model.modules.fast_attention import (
-                set_packed_segment_length,
-                uniform_segment_length,
-            )
-
-            set_packed_segment_length(uniform_segment_length(vl_input["image_grid_thw"]))
-        # Only the pre-norm output of the last kept decoder layer is used (== the causal-LM wrapper's
-        # hidden_states[-1]). Capture it with a hook while running the base Qwen3VLModel, which skips
-        # the lm_head entirely: even with logits_to_keep=1 the (B, 151k-vocab) GEMM cost ~90 ms per
-        # 1024-sample step on B300 (cuBLAS has no good kernel for that shape).
+        vl_input["pixel_values"] = self.normalize_pixel_values(vl_input["pixel_values"])
+        # Match the causal-LM wrapper's pre-norm hidden_states[-1] without computing logits.
         self._last_layer_output = None
         self.model.model(**vl_input)
         outputs, self._last_layer_output = self._last_layer_output, None

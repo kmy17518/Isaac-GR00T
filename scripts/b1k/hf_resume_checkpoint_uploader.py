@@ -1,24 +1,21 @@
 #!/usr/bin/env python
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Keep the latest *full* (resumable) checkpoint of a run on the Hub -- and only that one.
+"""Keep the latest full resumable checkpoint in the Hub's current tree.
 
-Complements hf-checkpoint-uploader.py (eval-only copies at scheduled steps). Every poll it looks for
-the newest *complete* ``checkpoint-<step>`` in the run dir that is newer than the one on the Hub and
-replaces the Hub copy in a single commit:
+Complements hf_checkpoint_uploader.py (eval-only copies at scheduled steps). Each replacement commit
+adds ``<prefix>/resume/checkpoint-<step>/**``, including optimizer and RNG state, and logically removes
+the previous checkpoint folders. Historical objects remain stored and continue to count against quota.
 
-  * adds ``<prefix>/resume/checkpoint-<step>/**`` -- everything, including the DeepSpeed
-    ``global_step<step>/`` optimizer/model partitions, ``latest``, ``rng_state_*.pth``, ``scheduler.pt``,
-    ``training_args.bin`` -- so ``--resume-from-checkpoint`` works on a downloaded copy;
-  * deletes the previous ``<prefix>/resume/checkpoint-*`` folder(s) in the same commit.
-
-Deleting files on the Hub does not free storage: the LFS objects stay referenced by history and count
-against the quota. So after each swap the LFS objects that the removed checkpoint owned and that no file
-in the current tree references any more are removed for good with
-``HfApi.permanently_delete_lfs_files(..., rewrite_history=True)``, which also rewrites the history so no
-commit points at them. Objects still referenced elsewhere -- e.g. the eval-only copy of the same step
-shares byte-identical ``model-*.safetensors`` -- are never touched. The status file records what was
-uploaded, what was freed, and the repo's LFS total.
+Automatic irreversible object deletion is disabled: independent publishers and other refs make live
+object scans unsafe. Durable transaction records in ``<status-file>.journal/`` retain replaced LFS
+candidates for explicit offline operator review, NOT a deletion allowlist. Collection requires stopping
+all writers and checking every ref; this monitor never performs it. Preserve the journal across restarts.
+The status reports verified uploads separately from pending offline GC candidates. Legacy status or a
+remote folder name alone is not proof of completion: without a journal, keep the latest local checkpoint
+for verification/republication, or wait for a newer complete checkpoint. If Trainer prunes a pending local
+checkpoint, recovery first checks for a lost commit response, then may supersede it with a newer complete
+local checkpoint. Both journals and all candidates are retained; superseded steps are not uploaded steps.
 
 Usage (run it detached, e.g. in tmux, next to the training job):
     python scripts/b1k/hf_resume_checkpoint_uploader.py --run-dir $OUTPUT_DIR/<exp> \
@@ -30,13 +27,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
+import uuid
 
 from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
 from huggingface_hub.hf_api import RepoFile
@@ -45,6 +45,10 @@ from huggingface_hub.utils import HfHubHTTPError
 
 log = logging.getLogger("hf-resume-uploader")
 CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
+
+
+class PendingCheckpointUnavailable(RuntimeError):
+    """The saved local manifest can no longer be used to retry a prepared upload."""
 
 
 def now() -> str:
@@ -100,10 +104,32 @@ def local_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
 
 
 def write_status(path: Path, status: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(status, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    """Atomically persist state before any remote mutation."""
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path.parent.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=path.parent, prefix=".pending-", delete=False
+        ) as f:
+            tmp = Path(f.name)
+            json.dump(status, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def lfs_sha(f: RepoFile) -> str | None:
@@ -112,11 +138,15 @@ def lfs_sha(f: RepoFile) -> str | None:
     return f.lfs["sha256"] if isinstance(f.lfs, dict) else f.lfs.sha256
 
 
-def remote_folder(api: HfApi, repo_id: str, path: str) -> list[RepoFile]:
+def remote_folder(
+    api: HfApi, repo_id: str, path: str, revision: str | None = None
+) -> list[RepoFile]:
     try:
         return [
             f
-            for f in api.list_repo_tree(repo_id, path, recursive=True, expand=True)
+            for f in api.list_repo_tree(
+                repo_id, path, recursive=True, expand=True, revision=revision, repo_type="model"
+            )
             if isinstance(f, RepoFile)
         ]
     except HfHubHTTPError as e:
@@ -131,10 +161,11 @@ def readme(prefix: str, step: int, repo_id: str, dest: str) -> str:
 `checkpoint-{step}/` is the most recent complete training checkpoint of `{prefix}`, uploaded as-is from the
 training run: model weights (`model-*.safetensors`), processor/config, and the DeepSpeed ZeRO-2 state
 (`global_step{step}/`, `latest`, `rng_state_*.pth`, `scheduler.pt`, `training_args.bin`), so training can be
-resumed from it. Only one such checkpoint is kept: each new one replaces the previous in a single commit and
-the previous checkpoint's LFS objects are permanently deleted (history rewritten) so they do not count
-against storage. For eval-only snapshots at scheduled steps see the sibling `checkpoint-*` folders in
-`{prefix}/`.
+resumed from it. Each new checkpoint logically replaces the previous in a single commit. Historical LFS
+objects are retained and still count against storage; automatic irreversible deletion is disabled.
+The uploader's local transaction journal retains candidates for offline operator review after all writers
+are stopped and every ref is checked. Candidates may still be referenced and are not a deletion allowlist.
+For eval-only snapshots at scheduled steps see the sibling `checkpoint-*` folders in `{prefix}/`.
 
 Resume:
 
@@ -147,122 +178,359 @@ Updated {now()}.
 """
 
 
-def upload_checkpoint(api: HfApi, args, step: int, ckpt: Path, status: dict) -> None:
-    dest = f"{args.path_prefix.strip('/')}/{args.dest_subdir.strip('/')}"
-    new_folder = f"{dest}/checkpoint-{step}"
+def destination(args) -> str:
+    parts = f"{args.path_prefix}/{args.dest_subdir}".split("/")
+    if ".." in parts or any("\\" in part for part in parts):
+        raise ValueError("Hub paths must not contain '..' or backslashes")
+    dest = "/".join(part for part in parts if part not in ("", "."))
+    if not dest:
+        raise ValueError("the resume destination must be a nonempty folder")
+    return dest
 
-    # what the Hub holds now (paths + LFS object ids), to delete and later garbage-collect
-    old_files = remote_folder(api, args.repo_id, dest)
-    old_folders = sorted(
-        {
-            f.path.split("/")[len(dest.split("/"))]
-            for f in old_files
-            if f.path.startswith(dest + "/checkpoint-")
-        }
+
+def journal_dir(args) -> Path:
+    return args.status_file.with_name(args.status_file.name + ".journal")
+
+
+def write_transaction(path: Path, transaction: dict) -> None:
+    payload = json.dumps(transaction, sort_keys=True).encode()
+    write_status(
+        path,
+        {"version": 1, "sha256": hashlib.sha256(payload).hexdigest(), "transaction": transaction},
     )
-    old_oids = {sha for f in old_files if (sha := lfs_sha(f))}
 
-    ops: list = []
-    n_bytes = 0
-    files = []
-    for root, _dirs, names in os.walk(ckpt):
-        for name in names:
-            src = Path(root) / name
-            rel = src.relative_to(ckpt).as_posix()
-            files.append((src, rel))
-            n_bytes += src.stat().st_size
-            ops.append(
-                CommitOperationAdd(path_in_repo=f"{new_folder}/{rel}", path_or_fileobj=str(src))
+
+def load_transactions(args) -> list[tuple[Path, dict]]:
+    records = []
+    for path in sorted(journal_dir(args).glob("*.json")):
+        try:
+            envelope = json.loads(path.read_text())
+            record = envelope["transaction"]
+            checksum = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+            if envelope["version"] != 1 or envelope["sha256"] != checksum:
+                raise ValueError("invalid checksum or version")
+            if (
+                record["phase"] not in ("prepared", "committed", "verified", "superseded")
+                or not isinstance(record["step"], int)
+                or not isinstance(record["repo_id"], str)
+                or not isinstance(record["dest"], str)
+                or not isinstance(record["files"], dict)
+                or not record["files"]
+                or not isinstance(record["gc_candidates"], dict)
+            ):
+                raise ValueError("invalid transaction")
+            if record["phase"] == "superseded" and (
+                not isinstance(record["superseded_by"], str)
+                or not isinstance(record["superseded_by_step"], int)
+                or record["superseded_by_step"] <= record["step"]
+            ):
+                raise ValueError("invalid superseded transaction")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise RuntimeError(
+                f"Unreadable resume journal {path}; restore it from backup before retrying. "
+                "Do not discard it: it may contain historical object candidates."
+            ) from e
+        records.append((path, record))
+    by_name = {path.name: record for path, record in records}
+    for path, record in records:
+        if record["phase"] != "superseded":
+            continue
+        successor = by_name.get(record["superseded_by"])
+        if successor is None or (successor["repo_id"], successor["dest"], successor["step"]) != (
+            record["repo_id"],
+            record["dest"],
+            record["superseded_by_step"],
+        ):
+            raise RuntimeError(
+                f"Missing or mismatched successor journal for {path}; restore it from backup"
             )
-    ops.append(
-        CommitOperationAdd(
-            path_in_repo=f"{dest}/README.md",
-            path_or_fileobj=readme(args.path_prefix, step, args.repo_id, dest).encode(),
-        )
-    )
-    for folder in old_folders:
-        if folder != f"checkpoint-{step}":
-            ops.append(CommitOperationDelete(path_in_repo=f"{dest}/{folder}/", is_folder=True))
-    log.info(
-        "uploading %s: %d files, %.1f GB -> %s/%s (replacing %s)",
-        ckpt.name,
-        len(files),
-        n_bytes / 1e9,
-        args.repo_id,
-        new_folder,
-        old_folders or "nothing",
-    )
-    status.update({"pending_step": step, "pending_since": now()})
-    write_status(args.status_file, status)
-    t0 = time.time()
-    info = api.create_commit(
-        repo_id=args.repo_id,
-        operations=ops,
-        commit_message=f"{args.path_prefix}: full checkpoint {step} for resume"
-        + (f" (replaces {', '.join(old_folders)})" if old_folders else ""),
-    )
-    log.info("committed in %.0fs: %s", time.time() - t0, info.commit_url)
+    return records
 
-    # verify every file landed with the right size
-    remote = {f.path: f for f in remote_folder(api, args.repo_id, new_folder)}
-    missing = [rel for src, rel in files if f"{new_folder}/{rel}" not in remote]
-    wrong = [
-        rel
-        for src, rel in files
-        if f"{new_folder}/{rel}" in remote
-        and remote[f"{new_folder}/{rel}"].size not in (None, src.stat().st_size)
+
+def file_manifest(ckpt: Path) -> dict[str, dict]:
+    files = {}
+    for src in sorted(ckpt.rglob("*")):
+        if not src.is_file():
+            continue
+        size = src.stat().st_size
+        sha = hashlib.sha256()
+        blob = hashlib.sha1(f"blob {size}\0".encode())
+        with src.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                sha.update(chunk)
+                blob.update(chunk)
+        files[src.relative_to(ckpt).as_posix()] = {
+            "size": size,
+            "sha256": sha.hexdigest(),
+            "blob_id": blob.hexdigest(),
+        }
+    if not files:
+        raise RuntimeError(f"No checkpoint files at {ckpt}; preserve the pending journal")
+    return files
+
+
+def checkpoint_files(files: list[RepoFile], dest: str) -> list[RepoFile]:
+    return [
+        f
+        for f in files
+        if f.path.startswith(dest + "/")
+        and CKPT_RE.fullmatch(f.path[len(dest) + 1 :].split("/")[0])
     ]
-    if missing or wrong:
-        raise RuntimeError(f"verification failed: missing {missing[:5]} size-mismatch {wrong[:5]}")
 
-    # garbage-collect the replaced checkpoint's LFS objects that nothing references any more
-    freed = 0
-    deleted = 0
-    if old_oids:
-        tree_oids = {
-            sha
-            for f in api.list_repo_tree(args.repo_id, recursive=True, expand=True)
-            if isinstance(f, RepoFile) and (sha := lfs_sha(f))
-        }
-        victims = [
-            x
-            for x in api.list_lfs_files(args.repo_id)
-            if x.file_oid in old_oids and x.file_oid not in tree_oids
-        ]
-        if victims:
-            api.permanently_delete_lfs_files(args.repo_id, victims, rewrite_history=True)
-            deleted = len(victims)
-            freed = sum(x.size for x in victims)
-            log.info(
-                "permanently deleted %d LFS objects (%.1f GB) of the replaced checkpoint, history rewritten",
-                deleted,
-                freed / 1e9,
-            )
-        else:
-            log.info("no LFS objects to delete (all still referenced or none existed)")
-    lfs_total = sum(x.size for x in api.list_lfs_files(args.repo_id))
+
+def prepare_replacement(api: HfApi, path: Path, record: dict) -> None:
+    # Optimistic concurrency protects the folder replacement, not irreversible object collection.
+    head = api.repo_info(record["repo_id"], repo_type="model", revision="main").sha
+    old_files = checkpoint_files(
+        remote_folder(api, record["repo_id"], record["dest"], head), record["dest"]
+    )
+    folders = sorted({f.path[len(record["dest"]) + 1 :].split("/")[0] for f in old_files})
+    if any(int(CKPT_RE.fullmatch(folder).group(1)) > record["step"] for folder in folders):
+        raise RuntimeError("A newer resume checkpoint is already published; refusing to replace it")
+    for f in old_files:
+        oid = lfs_sha(f)
+        if oid:
+            candidate = record["gc_candidates"].setdefault(oid, {"size": f.size, "paths": []})
+            candidate["paths"] = sorted(set(candidate["paths"]) | {f.path})
+    record.update({"parent_commit": head, "replaced": folders})
+    write_transaction(path, record)
+
+
+def verify_remote(api: HfApi, record: dict, revision: str | None) -> bool:
+    folder = f"{record['dest']}/checkpoint-{record['step']}"
+    remote = {
+        f.path: f
+        for f in checkpoint_files(
+            remote_folder(api, record["repo_id"], record["dest"], revision), record["dest"]
+        )
+    }
+    if set(remote) != {f"{folder}/{rel}" for rel in record["files"]}:
+        return False
+    for rel, expected in record["files"].items():
+        actual = remote.get(f"{folder}/{rel}")
+        if actual is None or actual.size != expected["size"]:
+            return False
+        if lfs_sha(actual):
+            if lfs_sha(actual) != expected["sha256"]:
+                return False
+        elif actual.blob_id != expected["blob_id"]:
+            return False
+    return True
+
+
+def update_status(args, status: dict) -> None:
+    records = [
+        record
+        for _, record in load_transactions(args)
+        if (record["repo_id"], record["dest"]) == (args.repo_id, destination(args))
+    ]
+    pending = [record for record in records if record["phase"] in ("prepared", "committed")]
+    verified = [record for record in records if record["phase"] == "verified"]
+    status["uploaded_step"] = max((record["step"] for record in verified), default=0)
+    candidates = {oid for record in records for oid in record["gc_candidates"]}
+    for key in ("uploaded_at", "commit", "files", "bytes", "replaced"):
+        status.pop(key, None)
+    if verified:
+        latest = max(verified, key=lambda record: record["step"])
+        status.update(
+            {
+                "uploaded_step": max(status.get("uploaded_step", 0), latest["step"]),
+                "uploaded_at": latest["verified_at"],
+                "commit": latest.get("commit_url"),
+                "files": len(latest["files"]),
+                "bytes": sum(f["size"] for f in latest["files"].values()),
+                "replaced": latest["replaced"],
+            }
+        )
+    for key in ("repo_lfs_total_bytes", "upload_seconds"):
+        status.pop(key, None)
     status.update(
         {
-            "uploaded_step": step,
-            "uploaded_at": now(),
-            "commit": info.commit_url,
-            "files": len(files),
-            "bytes": n_bytes,
-            "replaced": old_folders,
-            "lfs_objects_deleted": deleted,
-            "freed_bytes": freed,
-            "repo_lfs_total_bytes": lfs_total,
-            "pending_step": None,
-            "pending_since": None,
+            "repo_id": args.repo_id,
+            "repo_path": destination(args),
+            "gc_policy": "offline_only",
+            "gc_journal": str(journal_dir(args)),
+            "pending_gc_candidates": sorted(candidates),
+            "superseded_steps": sorted(
+                {record["step"] for record in records if record["phase"] == "superseded"}
+            ),
+            "lfs_objects_deleted": 0,
+            "freed_bytes": 0,
+            "pending_step": pending[0]["step"] if pending else None,
+            "pending_since": pending[0]["created_at"] if pending else None,
             "last_error": "",
-            "upload_seconds": round(time.time() - t0),
         }
     )
     write_status(args.status_file, status)
+
+
+def finish_transaction(api: HfApi, path: Path, record: dict, recovering: bool = True) -> None:
+    if record["phase"] == "prepared":
+        # A lost commit response is recoverable without re-uploading or the local checkpoint.
+        head = (
+            api.repo_info(record["repo_id"], repo_type="model", revision="main").sha
+            if recovering
+            else record["parent_commit"]
+        )
+        if recovering and verify_remote(api, record, head):
+            record.update({"phase": "committed", "commit_oid": head})
+            write_transaction(path, record)
+        else:
+            ckpt = Path(record["checkpoint"])
+            if recovering:
+                try:
+                    available = file_manifest(ckpt) == record["files"]
+                except (OSError, RuntimeError) as e:
+                    raise PendingCheckpointUnavailable(
+                        f"Pending checkpoint unavailable at {ckpt}; restore it or provide a newer complete checkpoint"
+                    ) from e
+                if not available:
+                    raise PendingCheckpointUnavailable(
+                        "Pending checkpoint changed; restore it or provide a newer complete checkpoint"
+                    )
+                prepare_replacement(api, path, record)
+            folder = f"{record['dest']}/checkpoint-{record['step']}"
+            ops = [
+                CommitOperationDelete(path_in_repo=f"{record['dest']}/{old}/", is_folder=True)
+                for old in record["replaced"]
+            ]
+            ops.extend(
+                CommitOperationAdd(path_in_repo=f"{folder}/{rel}", path_or_fileobj=str(ckpt / rel))
+                for rel in record["files"]
+            )
+            ops.append(
+                CommitOperationAdd(
+                    path_in_repo=f"{record['dest']}/README.md",
+                    path_or_fileobj=readme(
+                        record["prefix"], record["step"], record["repo_id"], record["dest"]
+                    ).encode(),
+                )
+            )
+            info = api.create_commit(
+                repo_id=record["repo_id"],
+                repo_type="model",
+                revision="main",
+                operations=ops,
+                parent_commit=record["parent_commit"],
+                commit_message=f"{record['dest']}: full checkpoint {record['step']} (history retained)",
+                commit_description="Logical checkpoint replacement only; automatic irreversible GC is disabled.",
+            )
+            record.update(
+                {"phase": "committed", "commit_oid": info.oid, "commit_url": info.commit_url}
+            )
+            write_transaction(path, record)
+    if not verify_remote(api, record, record["commit_oid"]):
+        raise RuntimeError(
+            "Checkpoint verification failed; pending transaction retained for recovery"
+        )
+    record.update({"phase": "verified", "verified_at": now()})
+    write_transaction(path, record)
+
+
+def prepare_upload(api: HfApi, args, step: int, ckpt: Path) -> tuple[Path, dict]:
+    record = {
+        "repo_id": args.repo_id,
+        "dest": destination(args),
+        "prefix": "/".join(part for part in args.path_prefix.split("/") if part not in ("", ".")),
+        "step": step,
+        "checkpoint": str(ckpt.resolve()),
+        "files": file_manifest(ckpt),
+        "gc_candidates": {},
+        "phase": "prepared",
+        "created_at": now(),
+    }
+    path = journal_dir(args) / f"{uuid.uuid4().hex}.json"
+    prepare_replacement(api, path, record)
+    return path, record
+
+
+def newer_complete_checkpoint(
+    args, step: int, successor: tuple[int, Path] | None
+) -> tuple[int, Path] | None:
+    candidates = [successor] if successor is not None else []
+    run_dir = getattr(args, "run_dir", None)
+    if run_dir is not None and Path(run_dir).is_dir():
+        candidates.extend(local_checkpoints(Path(run_dir)))
+    for candidate_step, checkpoint in sorted(candidates, reverse=True):
+        if candidate_step <= step:
+            continue
+        try:
+            if full_checkpoint_complete(
+                checkpoint,
+                candidate_step,
+                getattr(args, "num_gpus", 4),
+                getattr(args, "quiet_seconds", 120),
+            ):
+                return candidate_step, checkpoint
+        except OSError:
+            continue
+    return None
+
+
+def recover_pending(
+    api: HfApi, args, status: dict, successor: tuple[int, Path] | None = None
+) -> None:
+    while True:
+        records = [
+            (path, record)
+            for path, record in load_transactions(args)
+            if (record["repo_id"], record["dest"]) == (args.repo_id, destination(args))
+        ]
+        pending = [
+            (path, record)
+            for path, record in records
+            if record["phase"] in ("prepared", "committed")
+        ]
+        if not pending:
+            break
+        path, record = min(pending, key=lambda item: item[1]["step"])
+        try:
+            finish_transaction(api, path, record)
+        except PendingCheckpointUnavailable:
+            # finish_transaction checks the remote manifest before consulting the local source.
+            replacement = newer_complete_checkpoint(args, record["step"], successor)
+            if replacement is None:
+                raise
+            replacement_step, checkpoint = replacement
+            existing = [
+                (p, r)
+                for p, r in records
+                if r["step"] == replacement_step and r["phase"] != "superseded"
+            ]
+            if existing:
+                replacement_path, _ = existing[0]
+            else:
+                replacement_path, _ = prepare_upload(api, args, replacement_step, checkpoint)
+            # Persist the successor first so a crash cannot leave only a retired transaction.
+            record.update(
+                {
+                    "phase": "superseded",
+                    "superseded_at": now(),
+                    "superseded_by": replacement_path.name,
+                    "superseded_by_step": replacement_step,
+                    "superseded_reason": "local checkpoint unavailable; newer complete checkpoint selected",
+                }
+            )
+            write_transaction(path, record)
+            update_status(args, status)
+            log.warning(
+                "superseded unavailable checkpoint %d with complete checkpoint %d; GC candidates retained",
+                record["step"],
+                replacement_step,
+            )
+    update_status(args, status)
+
+
+def upload_checkpoint(api: HfApi, args, step: int, ckpt: Path, status: dict) -> None:
+    recover_pending(api, args, status, successor=(step, ckpt))
+    if status["uploaded_step"] >= step:
+        return
+    path, record = prepare_upload(api, args, step, ckpt)
+    update_status(args, status)
+    finish_transaction(api, path, record, recovering=False)
+    update_status(args, status)
     log.info(
-        "repo LFS total now %.1f GB; latest full checkpoint on the Hub: %d",
-        lfs_total / 1e9,
-        step,
+        "verified full checkpoint %d; history retained, GC candidates require offline review", step
     )
 
 
@@ -296,7 +564,7 @@ def main() -> int:
         "--staging-dir",
         type=Path,
         default=None,
-        help="where resume-status.json is written (default: the run dir)",
+        help="where resume-status.json and its durable .journal/ are kept (default: the run dir)",
     )
     p.add_argument(
         "--status-file", type=Path, default=None, help="overrides <staging-dir>/resume-status.json"
@@ -313,23 +581,16 @@ def main() -> int:
         log.error("HF_TOKEN is not set")
         return 2
     api = HfApi()
-    status = json.loads(args.status_file.read_text()) if args.status_file.exists() else {}
-    status.setdefault("uploaded_step", 0)
-    # what is on the Hub already (in case the status file was lost)
-    dest = f"{args.path_prefix.strip('/')}/{args.dest_subdir.strip('/')}"
+    dest = destination(args)
     try:
-        remote_steps = sorted(
-            {
-                int(m.group(1))
-                for f in remote_folder(api, args.repo_id, dest)
-                for m in [CKPT_RE.match(f.path.split("/")[len(dest.split("/"))])]
-                if m
-            }
-        )
-        if remote_steps:
-            status["uploaded_step"] = max(status["uploaded_step"], max(remote_steps))
-    except HfHubHTTPError as e:
-        log.warning("could not list %s: %s", dest, e)
+        status = json.loads(args.status_file.read_text())
+        if not isinstance(status, dict):
+            status = {}
+    except (OSError, ValueError):
+        status = {}
+    if (status.get("repo_id"), status.get("repo_path")) != (args.repo_id, dest):
+        status = {}
+    status.setdefault("uploaded_step", 0)
     log.info(
         "watching %s -> %s/%s (latest on Hub: %s)",
         args.run_dir,
@@ -340,6 +601,13 @@ def main() -> int:
     backoff = args.poll_seconds
     while True:
         try:
+            recover_pending(api, args, status)
+            if args.max_steps and status["uploaded_step"] >= args.max_steps:
+                log.info(
+                    "final checkpoint %d verified; historical objects retained",
+                    status["uploaded_step"],
+                )
+                return 0
             complete = [
                 (s, c)
                 for s, c in local_checkpoints(args.run_dir)

@@ -13,24 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``torch.compile`` for the repeated transformer blocks of Gr00tN1d7 (training-side speed knob).
+"""Training-only compilation of repeated transformer blocks without renaming parameters.
 
-A GR00T training step is dominated by unfused elementwise kernels (casts, rotary, norms, residuals,
-activations) around the GEMMs -- ~45 % of GPU time at 1024 samples/GPU on B300. Inductor fuses
-those, but compiling the whole model is fragile (HF glue code with data-dependent Python), so this
-compiles only the *blocks*, whose inputs have fixed shapes every step:
-
-* ``vision``: ``Qwen3VLVisionBlock`` x depth (frozen, forward only)
-* ``llm``:    ``Qwen3VLTextDecoderLayer`` x select_layer (frozen, forward only)
-* ``dit``:    the action head's ``BasicTransformerBlock`` s (trained)
-* ``vlsa``:   the action head's VL self-attention blocks (trained)
-
-Only each block's bound ``forward`` is wrapped, so parameters, module names and the state dict are
-untouched (checkpoints stay identical in layout). Not bit-identical to eager: fusion changes where
-intermediate roundings happen, at bf16 noise level.
-
-Keep this a *training* setting (``TrainingConfig.compile_blocks``), not part of the saved model
-config: serving runs different batch shapes and should stay eager.
+Supported groups are ``vision``, ``llm``, ``dit``, and ``vlsa``. Multi-task batches can change
+sequence lengths, and compiled backward correctness depends on the distributed configuration.
+The training entry point validates the supported DeepSpeed combinations before model setup.
+Serving remains eager; compile settings are not part of the saved model configuration.
 """
 
 from __future__ import annotations
@@ -44,6 +32,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 VALID_TARGETS = ("vision", "llm", "dit", "vlsa")
+
+
+def check_training_compile_compatibility(training) -> None:
+    """Reject DeepSpeed compile combinations without production gradient validation."""
+    targets = {
+        target.strip() for target in (training.compile_blocks or "").split(",") if target.strip()
+    }
+    unknown = targets - set(VALID_TARGETS)
+    if unknown:
+        raise ValueError(f"unknown compile targets {sorted(unknown)}; valid: {VALID_TARGETS}")
+    if training.num_gpus > 1 and not training.use_ddp and targets not in (set(), {"dit"}, {"vlsa"}):
+        raise ValueError(
+            "Multi-GPU DeepSpeed supports only eager training, --compile-blocks dit, or "
+            "--compile-blocks vlsa. Compiling dit and vlsa together produced corrupted "
+            "gradients on real multi-task bf16 batches with torch 2.10/CUDA 13; other "
+            "combinations have not passed production gradient validation. Remove "
+            "--compile-blocks or select one supported group. Single-GPU and DDP "
+            "configurations still require their own gradient validation."
+        )
 
 
 def _block_lists(model) -> dict[str, torch.nn.ModuleList | None]:

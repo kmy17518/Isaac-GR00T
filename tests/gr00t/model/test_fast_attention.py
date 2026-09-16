@@ -57,20 +57,17 @@ class TestGr00tFastAttention:
         total = n_seg * seg
         q, k, v = (torch.randn(1, h, total, d) for _ in range(3))
         cu = torch.arange(0, total + 1, seg, dtype=torch.int32)
-        fa.set_packed_segment_length(seg)
-        try:
-            out, _ = fa.gr00t_fast_attention_forward(
-                _Module(False),
-                q,
-                k,
-                v,
-                attention_mask=None,
-                cu_seq_lens_q=cu,
-                cu_seq_lens_k=cu,
-                is_causal=False,
-            )
-        finally:
-            fa.set_packed_segment_length(None)
+        out, _ = fa.gr00t_fast_attention_forward(
+            _Module(False),
+            q,
+            k,
+            v,
+            attention_mask=None,
+            cu_seq_lens_q=cu,
+            cu_seq_lens_k=cu,
+            packed_segment_length=seg,
+            is_causal=False,
+        )
         assert out.shape == (1, total, h, d)
         for i in range(n_seg):
             sl = slice(i * seg, (i + 1) * seg)
